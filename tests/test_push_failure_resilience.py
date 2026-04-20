@@ -120,19 +120,19 @@ def test_push_failure_on_complete_preserves_running_state_and_signals_error(caps
     assert actionable is True
 
 
-def test_source_inspection_reports_missing_retry_backoff_as_high_risk(capsys):
+def test_source_inspection_reports_retry_backoff_presence_in_job_store(capsys):
     source_path = Path("state/job_store.py")
     source_text = source_path.read_text(encoding="utf-8").lower()
 
     keywords = ("retry", "backoff", "429", "sleep")
-    missing = [keyword for keyword in keywords if keyword not in source_text]
-    risk = "HIGH" if missing else "LOW"
+    present = [keyword for keyword in keywords if keyword in source_text]
+    risk = "LOW" if len(present) == len(keywords) else "HIGH"
 
     print(f"source_inspection_path={source_path}")
-    print(f"missing_keywords={missing}")
+    print(f"present_keywords={present}")
     print(f"risk_classification={risk}")
 
     out = capsys.readouterr().out
-    assert "risk_classification=HIGH" in out
-    assert missing
-    assert risk == "HIGH"
+    assert "source_inspection_path=state/job_store.py" in out
+    assert "present_keywords=" in out
+    assert risk == "LOW"
