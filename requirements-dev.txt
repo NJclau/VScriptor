@@ -1,4 +1,9 @@
+-r requirements.txt
+
 pytest==8.2.2
+
 pytest-asyncio==0.23.7
+
 jiwer==3.0.4
+
 audiomentations==0.36.0
