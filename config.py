@@ -21,6 +21,7 @@ MAX_AUDIO_DURATION_SECS = 180.0
 # Durable state (HF dataset)
 HF_DATASET_REPO = "mbaza-nlp/stt-job-state"
 JOB_STATE_FILE = "jobs.json"
+JOB_STATE_DIR = "jobs"  # Hub dataset subdirectory for sharded state files
 CACHE_POLL_INTERVAL_SECS = 5
 
 # Hub backoff settings
