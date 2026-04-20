@@ -1,161 +1,100 @@
-"""Durable job state store backed by a Hugging Face dataset repository.
-
-This module is the single write path for persisted job state. Callers should use
-its transition APIs and avoid calling Hub write APIs directly.
-"""
+"""Durable job store implementation."""
 
 from __future__ import annotations
 
+import copy
 import json
 import os
-import tempfile
 import threading
-import time
-from enum import Enum
-from pathlib import Path
-from typing import Any
+import uuid
+from datetime import datetime, timezone
 
-from huggingface_hub import hf_hub_download, upload_file
+from config import JOB_STATE_FILE
 
-HF_DATASET_REPO = os.getenv("HF_DATASET_REPO", "mbaza-nlp/stt-job-state")
-JOB_STATE_FILE = os.getenv("JOB_STATE_FILE", "jobs.json")
-BACKOFF_BASE_SECS = float(os.getenv("BACKOFF_BASE_SECS", "1.0"))
-BACKOFF_MAX_SECS = float(os.getenv("BACKOFF_MAX_SECS", "30.0"))
-BACKOFF_MULTIPLIER = float(os.getenv("BACKOFF_MULTIPLIER", "2.0"))
-
-_write_lock = threading.Lock()
+_WRITE_LOCK = threading.Lock()
 
 
-class JobStatus(str, Enum):
-    """Allowed persistent lifecycle statuses for a transcription job."""
-
-    QUEUED = "queued"
-    PROCESSING = "processing"
-    COMPLETE = "complete"
-    FAILED = "failed"
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
 
-def _pull_from_hub() -> dict[str, dict[str, Any]]:
-    """Download the latest persisted jobs map from the Hub dataset repo."""
-
-    try:
-        file_path = hf_hub_download(
-            repo_id=HF_DATASET_REPO,
-            filename=JOB_STATE_FILE,
-            repo_type="dataset",
-            force_download=True,
-        )
-        with open(file_path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        return data if isinstance(data, dict) else {}
-    except Exception:
+def _read_jobs_file() -> dict[str, dict]:
+    if not os.path.exists(JOB_STATE_FILE):
         return {}
+    with open(JOB_STATE_FILE, "r", encoding="utf-8") as file_handle:
+        data = json.load(file_handle)
+    return data if isinstance(data, dict) else {}
 
 
-def _is_rate_limited(error: Exception) -> bool:
-    """Return True only for Hub HTTP 429 responses."""
-
-    response = getattr(error, "response", None)
-    status_code = getattr(response, "status_code", None)
-    if status_code == 429:
-        return True
-
-    message = str(error).lower()
-    return "429" in message or "rate limit" in message
+def _write_jobs_file(data: dict[str, dict]) -> None:
+    with open(JOB_STATE_FILE, "w", encoding="utf-8") as file_handle:
+        json.dump(data, file_handle, indent=2, ensure_ascii=False)
 
 
-def _push_to_hub(jobs: dict[str, dict[str, Any]]) -> None:
-    """Persist the full jobs map with retries on HTTP 429 only."""
-
-    temp_path: str | None = None
-    try:
-        with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tmp:
-            json.dump(jobs, tmp, ensure_ascii=False, indent=2, sort_keys=True)
-            temp_path = tmp.name
-
-        attempt_delay = BACKOFF_BASE_SECS
-        while True:
-            try:
-                upload_file(
-                    path_or_fileobj=temp_path,
-                    path_in_repo=JOB_STATE_FILE,
-                    repo_id=HF_DATASET_REPO,
-                    repo_type="dataset",
-                )
-                return
-            except Exception as err:
-                if not _is_rate_limited(err):
-                    raise
-                time.sleep(min(attempt_delay, BACKOFF_MAX_SECS))
-                attempt_delay = min(BACKOFF_MAX_SECS, attempt_delay * BACKOFF_MULTIPLIER)
-    finally:
-        if temp_path:
-            Path(temp_path).unlink(missing_ok=True)
+def load_all_jobs() -> dict[str, dict]:
+    """Load all durable jobs."""
+    with _WRITE_LOCK:
+        return copy.deepcopy(_read_jobs_file())
 
 
-def create_job(job_id: str, audio_path: str, duration_secs: float, total_chunks: int = 0) -> dict[str, Any]:
-    """Create a new queued job record and persist it."""
-
-    with _write_lock:
-        jobs = _pull_from_hub()
+def create_job(filename: str, duration_secs: float) -> tuple[str, dict]:
+    """Create a queued job and persist it."""
+    with _WRITE_LOCK:
+        jobs = _read_jobs_file()
+        job_id = str(uuid.uuid4())
         record = {
             "job_id": job_id,
-            "status": JobStatus.QUEUED.value,
-            "audio_path": audio_path,
+            "filename": filename,
             "duration_secs": duration_secs,
-            "total_chunks": total_chunks,
-            "chunks_done": 0,
-            "transcripts": [],
-            "final_transcript": "",
+            "status": "queued",
+            "chunks": [],
+            "result_text": "",
             "error": None,
+            "created_at": _now_iso(),
+            "updated_at": _now_iso(),
         }
         jobs[job_id] = record
-        _push_to_hub(jobs)
-        return record
+        _write_jobs_file(jobs)
+        return job_id, copy.deepcopy(record)
 
 
-def update_job_chunk(job_id: str, chunk_index: int, transcript: str) -> dict[str, Any]:
-    """Record a processed chunk and move job into processing state."""
-
-    with _write_lock:
-        jobs = _pull_from_hub()
+def update_job_chunk(job_id: str, chunk_index: int, text: str) -> dict:
+    """Persist one chunk update and transition to processing."""
+    with _WRITE_LOCK:
+        jobs = _read_jobs_file()
+        if job_id not in jobs:
+            raise KeyError(f"Job {job_id} not found")
         record = jobs[job_id]
-        record["status"] = JobStatus.PROCESSING.value
-        transcripts = record.setdefault("transcripts", [])
-        while len(transcripts) <= chunk_index:
-            transcripts.append("")
-        transcripts[chunk_index] = transcript
-        record["chunks_done"] = int(record.get("chunks_done", 0)) + 1
-        _push_to_hub(jobs)
-        return record
+        record["status"] = "processing"
+        record["chunks"].append({"chunk_index": chunk_index, "text": text})
+        record["updated_at"] = _now_iso()
+        _write_jobs_file(jobs)
+        return copy.deepcopy(record)
 
 
-def complete_job(job_id: str, final_transcript: str) -> dict[str, Any]:
-    """Mark a job complete and save its final transcript."""
-
-    with _write_lock:
-        jobs = _pull_from_hub()
+def complete_job(job_id: str, result_text: str) -> dict:
+    """Mark a job as complete."""
+    with _WRITE_LOCK:
+        jobs = _read_jobs_file()
+        if job_id not in jobs:
+            raise KeyError(f"Job {job_id} not found")
         record = jobs[job_id]
-        record["status"] = JobStatus.COMPLETE.value
-        record["final_transcript"] = final_transcript
-        record["error"] = None
-        _push_to_hub(jobs)
-        return record
+        record["status"] = "complete"
+        record["result_text"] = result_text
+        record["updated_at"] = _now_iso()
+        _write_jobs_file(jobs)
+        return copy.deepcopy(record)
 
 
-def fail_job(job_id: str, reason: str) -> dict[str, Any]:
-    """Mark a job failed and persist the failure reason."""
-
-    with _write_lock:
-        jobs = _pull_from_hub()
+def fail_job(job_id: str, reason: str) -> dict:
+    """Mark a job as failed."""
+    with _WRITE_LOCK:
+        jobs = _read_jobs_file()
+        if job_id not in jobs:
+            raise KeyError(f"Job {job_id} not found")
         record = jobs[job_id]
-        record["status"] = JobStatus.FAILED.value
+        record["status"] = "failed"
         record["error"] = reason
-        _push_to_hub(jobs)
-        return record
-
-
-def load_all_jobs() -> dict[str, dict[str, Any]]:
-    """Load all persisted jobs for startup recovery."""
-
-    return _pull_from_hub()
+        record["updated_at"] = _now_iso()
+        _write_jobs_file(jobs)
+        return copy.deepcopy(record)
