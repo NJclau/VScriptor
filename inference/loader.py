@@ -2,24 +2,21 @@
 
 import threading
 
-import nemo.collections.asr as nemo_asr
-import torch
+from transformers import Wav2Vec2BertForCTC, Wav2Vec2BertProcessor
 
-from config import FALLBACK_MODEL_NAME
+from config import MODEL_NAME
 
 _model_lock = threading.Lock()
 _model = None
+_processor = None
 
 
-def get_asr_model():
-    """Return a lazily loaded singleton ASR model moved to the active device."""
-    global _model
-    if _model is None:
+def get_model_and_processor():
+    """Return lazily loaded singleton model and processor."""
+    global _model, _processor
+    if _model is None or _processor is None:
         with _model_lock:
             if _model is None:
-                device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                model = nemo_asr.models.EncDecCTCModelBPE.from_pretrained(
-                    model_name=FALLBACK_MODEL_NAME,
-                )
-                _model = model.to(device.type)
-    return _model
+                _model = Wav2Vec2BertForCTC.from_pretrained(MODEL_NAME)
+                _processor = Wav2Vec2BertProcessor.from_pretrained(MODEL_NAME)
+    return _model, _processor
