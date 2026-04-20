@@ -1,0 +1,296 @@
+# AGENTS.md — stt-long-transcription
+# MbanzaNLP · Kinyarwanda ASR Service · DinoSoft Engineering Standards
+# Codex: read this file completely before touching any code.
+
+## 1. What This Repository Is
+
+This is the MbanzaNLP Kinyarwanda Speech-to-Text service. It is a Gradio application
+deployed on a Hugging Face free CPU Space that transcribes Kinyarwanda audio files
+using the Wav2Vec2-BERT 2.0 model fine-tuned on 1,000 hours of Kinyarwanda speech
+(checkpoint: `badrex/w2v-bert-2.0-kinyarwanda-asr-1000h`).
+
+The system is specifically architected for a free-tier Hugging Face Space, which means:
+- The Space's disk is ephemeral and is lost on every restart or configuration change.
+- The only durable storage is the HF Dataset repository (`mbaza-nlp/stt-job-state`).
+- The Space has no SLA, no guaranteed uptime, and restarts without warning.
+
+Every architectural decision in this codebase flows from those three facts.
+
+
+## 2. The Single Most Important Design Principle
+
+Read this once and never violate it:
+
+> **The Space only processes. The dataset repo owns durable state.
+> The Space maintains a volatile in-memory cache for live UI rendering only.**
+
+This means:
+- `state/job_store.py` is the ONLY module that calls the HF Hub API.
+- `state/cache.py` is a volatile dict. It is NEVER the source of truth.
+- `app.py` reads from `cache.py` only. It NEVER reads from the Hub directly.
+- The UI polls `cache.py` every 5 seconds. It NEVER polls the Hub.
+- Every durable write goes through `job_store.py` with backoff on HTTP 429.
+
+If you are about to write code that reads from the Hub in any module other than
+`state/job_store.py`, stop and reconsider. You are violating the architecture.
+
+---
+
+## 3. Repository Structure
+
+Every file has exactly one responsibility. Do not add logic to a file that belongs
+in another file. Do not merge responsibilities.
+
+```
+stt-long-transcription/
+├── app.py                  # Gradio UI only. No inference. No Hub calls.
+├── config.py               # ALL constants live here. Never hardcode values elsewhere.
+├── requirements.txt        # Production deps, ALL pinned to exact versions.
+├── requirements-dev.txt    # Dev/test deps (pytest, jiwer, audiomentations).
+├── Dockerfile              # Slim Python 3.10 base. No NeMo.
+├── wer_baseline.json       # WER regression gate. Updated by CI only.
+│
+├── inference/
+│   ├── loader.py           # Lazy model singleton. Loaded once on first request.
+│   ├── preprocess.py       # Load audio, mono, resample to 16kHz, normalise, duration.
+│   ├── chunker.py          # Sliding window chunks with 3s overlap. Returns file paths.
+│   ├── decoder.py          # CTC greedy decode: logits → string. Stateless.
+│   └── postprocess.py      # Stitch ordered chunk transcripts into one clean string.
+│
+├── state/
+│   ├── job_store.py        # ALL Hub reads and writes. The only durable state layer.
+│   └── cache.py            # Volatile in-memory read model. Never authoritative.
+│
+├── scheduler/
+│   └── admission.py        # Duration-based weighted slot control (asyncio.Semaphore).
+│
+└── tests/
+    ├── test_preprocess.py
+    ├── test_chunker.py
+    ├── test_decoder.py
+    ├── test_job_store.py
+    ├── test_admission.py
+    └── test_integration.py
+```
+
+---
+
+## 4. Before You Write Any Code
+
+Run the full test suite first. Confirm every existing test passes before making changes.
+
+```bash
+pip install -r requirements.txt -r requirements-dev.txt
+pytest tests/ -v --tb=short
+```
+
+Expected: all tests pass. If any test fails before you change anything, fix it first
+and commit the fix before beginning your task.
+
+---
+
+## 5. Coding Standards
+
+**Functions** must do one thing. If you can describe what a function does using the
+word "and", it does too much. Split it. No function body may exceed 40 lines.
+Every public function must have a docstring that states what it does, what its
+parameters are, and what it returns or raises.
+
+**Naming** must communicate intent without abbreviation. Use `audio_path` not `ap`.
+Use `chunk_index` not `ci`. Use `duration_secs` not `dur`. Constants in `config.py`
+use UPPER_CASE. Variables and functions use snake_case. Classes use PascalCase.
+
+**Error handling** must be explicit. Never use a bare `except:`. Always catch the
+specific exception type you expect. Always surface errors with enough context for a
+developer to debug them — include the job ID, file path, or chunk index in the
+exception message wherever those values are available.
+
+**No magic numbers.** Every numeric constant must be defined in `config.py` with a
+descriptive name. If you need a number that is not in `config.py`, add it there first,
+then import it. Never write a number directly into module code.
+
+**No hardcoded secrets.** The HF token must come from the `HF_TOKEN` environment
+variable. Never commit a token, key, or credential to the repository.
+
+**Imports** must be absolute, not relative. Write `from inference.preprocess import
+load_and_normalise`, not `from .preprocess import load_and_normalise`. This makes
+imports traceable from any directory.
+
+---
+
+## 6. The Admission Controller — Critical Usage Rule
+
+The `AdmissionController` in `scheduler/admission.py` uses `asyncio.Semaphore`.
+When you call `admission.acquire()`, you MUST call `admission.release(slot)` in a
+`finally` block. Failure to do this will leak a slot and permanently reduce concurrency.
+
+The correct pattern in every caller is:
+
+```python
+slot = await _admission.acquire(duration_secs=duration)
+try:
+    # ... all processing ...
+finally:
+    _admission.release(slot)
+```
+
+Never call `release()` only in the happy path. The `finally` block is not optional.
+
+---
+
+## 7. State Transition Rules
+
+A job record transitions through four statuses: `queued` → `processing` → `complete`
+or `failed`. The rules for when each transition happens are strict:
+
+- Set `queued` when the job is created in `job_store.create_job()`. This is the
+  only place where a new job record is born.
+- Set `processing` when the first `job_store.update_job_chunk()` write succeeds.
+  The first chunk write triggers this transition automatically inside `job_store.py`.
+- Set `complete` only after `inference/postprocess.stitch_chunks()` has run and
+  returned a non-empty string. Call `job_store.complete_job()` immediately after.
+- Set `failed` on any unhandled exception inside the transcription loop. Call
+  `job_store.fail_job(job_id, reason=str(e))` in the except block. Always include
+  the job ID in the user-facing error message returned from `app.py`.
+
+After every call to `job_store.*`, immediately call `cache.put(job_id, record)` to
+keep the volatile read model in sync. This is the only way the UI sees updates.
+
+---
+
+## 8. Hub Write Discipline
+
+The Hub API enforces rate limits on a 5-minute sliding window. A Hub write happens
+on every state transition: job create, each chunk complete, job complete, job fail.
+Do not add additional Hub writes beyond these four event types without explicit
+approval, because doing so risks hitting the 429 rate limit.
+
+The backoff implementation in `job_store._push_to_hub()` handles HTTP 429 with
+exponential backoff starting at `BACKOFF_BASE_SECS` and capped at `BACKOFF_MAX_SECS`.
+Do not catch HTTP 429 anywhere else in the codebase. Let it propagate to `_push_to_hub`.
+
+The UI refresh in `app.py` must use `cache.get_system_status()` and must be triggered
+by Gradio's `every=CACHE_POLL_INTERVAL_SECS` parameter on `demo.load()`. It must
+never call `job_store.load_all_jobs()` or any Hub API for UI refresh purposes.
+
+---
+
+## 9. Audio Duration Is the Admission Signal — Not File Size
+
+The admission controller routes jobs based on audio duration in seconds, not bytes.
+File size is format-dependent (bitrate varies by codec) and is not a reliable proxy
+for compute time. Duration must be obtained by calling
+`inference/preprocess.get_audio_duration_secs(path)`, which uses `torchaudio.info()`
+to read metadata without decoding the full file.
+
+The admission check must happen before any audio is loaded into memory. If you are
+writing a code path that loads audio before checking duration, you have the order wrong.
+
+---
+
+## 10. Test Requirements
+
+Write the test before writing the implementation. This is not a preference — it is
+the required workflow. Every task in the implementation plan follows this order:
+write failing test → run to confirm failure → implement → run to confirm pass → commit.
+
+Every test must be deterministic. Do not write tests that depend on network calls,
+real model inference, or wall clock time. Mock the Hub API in all `job_store` tests.
+Mock the model and processor in all decoder tests.
+
+Test names must describe the behaviour under test in plain English, not the function
+name. Write `test_short_job_acquires_priority_slot`, not `test_acquire`.
+
+The CI pipeline will fail if coverage of `inference/` and `state/` packages drops
+below 80%. Check coverage before committing with:
+
+```bash
+pytest tests/ --cov=inference --cov=state --cov-report=term-missing
+```
+
+---
+
+## 11. WER Regression Gate
+
+The file `wer_baseline.json` in the repository root records the last known-good WER
+for the model checkpoint named in `config.MODEL_NAME`. The CI pipeline measures WER
+against the Common Voice Kinyarwanda test split after every passing test run and
+blocks deployment if any domain's WER regresses by more than 2 percentage points
+absolute above the baseline value.
+
+Do not edit `wer_baseline.json` manually. It is updated only by the CI pipeline's
+`scripts/measure_wer.py` script after a validated deployment. If you believe the
+baseline is wrong, open a PR and justify the change in the PR description.
+
+---
+
+## 12. Commit Message Format
+
+Every commit must follow this format exactly:
+
+```
+<type>(<scope>): <short description in imperative mood>
+```
+
+Valid types: `feat`, `fix`, `refactor`, `test`, `chore`, `docs`.
+Valid scopes: `inference`, `state`, `scheduler`, `app`, `config`, `ci`, `docker`.
+
+Examples:
+- `feat(state): add exponential backoff on Hub 429 responses`
+- `fix(inference): correct overlap calculation in sliding window chunker`
+- `test(admission): add concurrent slot exhaustion test`
+- `refactor(app): remove Hub API call from UI status refresh`
+
+Do not write commits like "fix bug", "update code", or "changes". These are
+meaningless. The commit message is how the team understands the history of decisions.
+
+---
+
+## 13. What Not to Do
+
+The following patterns are explicitly banned. If you encounter them in existing code,
+flag them as part of your task before touching anything else.
+
+Do not call the Hub API from `app.py`, `cache.py`, or any `inference/` module. Only
+`state/job_store.py` may call the Hub.
+
+Do not use file size as a scheduling or duration signal. Only `torchaudio.info()` duration.
+
+Do not call `admission.release()` outside a `finally` block.
+
+Do not hardcode constants. Everything numeric goes in `config.py` first.
+
+Do not write to disk outside of the temporary directory provided to `chunk_audio()`.
+The Space's ephemeral disk must not be treated as persistent storage for any purpose.
+
+Do not catch bare `Exception` without re-raising or logging with the full context
+(job ID, file path, chunk index). Silent failures that produce no diagnostic information
+are worse than crashes because they are invisible.
+
+Do not add synchronous blocking calls to the Gradio event loop without wrapping them
+in `asyncio.to_thread()`. Long blocking calls in the event loop freeze the UI for
+every connected user simultaneously.
+
+---
+
+## 14. Environment Variables Required
+
+Set these as Hugging Face Space secrets before deployment. The app will not function
+without them.
+
+`HF_TOKEN` — A Hugging Face token with write access to the `mbaza-nlp/stt-job-state`
+dataset repository. This is used by `state/job_store.py` for all Hub reads and writes.
+
+No other secrets are required. The model checkpoint is loaded publicly via the
+`transformers` library without authentication.
+
+---
+
+## 15. Startup Sequence
+
+When the Space starts, `app.py` executes these steps at module import time in this
+order: (1) call `job_store.load_all_jobs()` to pull the full jobs JSON from the Hub,
+(2) call `cache.seed_from_store()` to populate the volatile read model, (3) create
+the singleton `AdmissionController`. If step 1 fails because the Hub is unreachable
+at startup, the cache starts empty and the system continues — existing jobs will not
+be recovered in this session, but new jobs can still be processed.
