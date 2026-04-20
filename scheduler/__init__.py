@@ -1,1 +1,1 @@
-"""Scheduler package for admission and queue orchestration."""
+"""Scheduler package."""

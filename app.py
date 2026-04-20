@@ -24,6 +24,13 @@ def transcription_text(audio_input):
     except Exception:
         return "Something went wrong, please contact the admin for support"
 
+with gr.Blocks() as demo:
+    gr.Markdown("## VScriptor — Kinyarwanda ASR")
+    audio_input = gr.Audio(label="Upload Audio", type="filepath")
+    job_id_output = gr.Textbox(label="Job ID", interactive=False)
+    transcription_output = gr.Textbox(label="Transcription", lines=6)
+    status_output = gr.Textbox(label="System Status", interactive=False)
+    transcribe_button = gr.Button("Transcribe")
 
 if __name__ == '__main__':
     with gr.Blocks() as demo:
