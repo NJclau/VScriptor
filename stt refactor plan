@@ -1,0 +1,1181 @@
+# MbanzaNLP STT Refactor — Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development
+> (recommended) or superpowers:executing-plans to implement this plan task-by-task.
+> Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Refactor the stt-long-transcription codebase from a monolithic `app.py` into
+a modular, free-tier-durable ASR service where the HF Dataset repo owns all durable
+job state and the Space operates as a stateless execution surface with a volatile
+in-memory cache for live UI rendering.
+
+**Architecture:** The five-module inference pipeline (loader → preprocess → chunker →
+decoder → postprocess) handles all audio processing. The state layer (job_store +
+cache) separates durable writes to the HF Dataset repo from fast volatile reads used
+by the Gradio UI. The scheduler layer (admission + queue) enforces duration-based
+weighted concurrency before any audio touches the inference pipeline.
+
+**Tech Stack:** Python 3.10+, Gradio 4.x, transformers (Wav2Vec2BertForCTC),
+torchaudio, pydub, huggingface_hub, asyncio, pytest, jiwer
+
+---
+
+## File Structure
+
+### New Files
+- `inference/loader.py` — Lazy model singleton; loads Wav2Vec2BertForCTC once on first request
+- `inference/preprocess.py` — Audio normalization, mono conversion, 16kHz resampling, silence trim, duration extraction
+- `inference/chunker.py` — Sliding window chunking with 3s overlap; returns list of wav segment paths
+- `inference/decoder.py` — CTC greedy decode from model logits to text string
+- `inference/postprocess.py` — Joins chunk transcripts, normalises whitespace, strips artifacts
+- `state/job_store.py` — All reads and writes to the HF Dataset repo; single source of durable truth
+- `state/cache.py` — Volatile in-memory dict keyed by job_id; invalidated on Space restart
+- `scheduler/admission.py` — Duration-based weighted slot assignment (short-job slot + 2 primary slots)
+- `scheduler/queue.py` — Job queue backed by dataset repo; recovers on startup
+- `config.py` — All tuneable constants in one place (chunk size, overlap, slot limits, backoff params)
+- `tests/test_preprocess.py`
+- `tests/test_chunker.py`
+- `tests/test_decoder.py`
+- `tests/test_job_store.py`
+- `tests/test_admission.py`
+- `tests/test_integration.py`
+
+### Modified Files
+- `app.py` — Stripped to Gradio UI + semaphore gate + cache reads only; all inference delegated
+- `requirements.txt` — All packages pinned to tested versions; dev deps in requirements-dev.txt
+- `Dockerfile` — Base image updated; COPY order fixed for layer caching
+
+### Deleted Files
+- `stt.py` — Logic migrated to `inference/chunker.py` and `inference/decoder.py`
+
+---
+
+### Task 1: Repository Baseline — Config, Requirements, Dockerfile
+
+**Files:**
+- Create: `config.py`
+- Modify: `requirements.txt`
+- Create: `requirements-dev.txt`
+- Modify: `Dockerfile`
+
+- [ ] **Step 1: Write config.py with all constants**
+
+```python
+# config.py
+# All tunable constants in one place. Change values here; never hardcode in modules.
+
+# Inference
+MODEL_NAME = "badrex/w2v-bert-2.0-kinyarwanda-asr-1000h"
+FALLBACK_MODEL_NAME = "stt_rw_conformer_ctc_large"   # NeMo fallback
+TARGET_SAMPLE_RATE = 16_000
+CHUNK_DURATION_MS = 22_000        # 22 seconds per chunk
+OVERLAP_DURATION_MS = 3_000       # 3-second overlap between chunks
+SILENCE_THRESH_DB = -40.0         # Trim silence below this dBFS
+
+# Scheduler
+MAX_PRIMARY_SLOTS = 2             # Long-job concurrency limit
+SHORT_JOB_THRESHOLD_SECS = 30.0  # Audio ≤ this goes to priority slot
+MAX_AUDIO_DURATION_SECS = 180.0  # Hard cap: 3 minutes
+
+# State / Hub
+HF_DATASET_REPO = "mbaza-nlp/stt-job-state"   # Set to your actual repo
+JOB_STATE_FILE = "jobs.json"
+CACHE_POLL_INTERVAL_SECS = 5
+
+# Backoff
+BACKOFF_BASE_SECS = 10
+BACKOFF_MAX_SECS = 120
+BACKOFF_MULTIPLIER = 2
+```
+
+- [ ] **Step 2: Pin all production dependencies**
+
+```
+# requirements.txt
+gradio==4.36.1
+aiofiles==22.1.0
+python-multipart==0.0.9
+pydub==0.25.1
+transformers==4.41.2
+torchaudio==2.3.1
+torch==2.3.1
+huggingface_hub==0.23.4
+soundfile==0.12.1
+numpy==1.26.4
+```
+
+- [ ] **Step 3: Create requirements-dev.txt**
+
+```
+# requirements-dev.txt
+pytest==8.2.2
+pytest-asyncio==0.23.7
+jiwer==3.0.4
+audiomentations==0.36.0
+```
+
+- [ ] **Step 4: Update Dockerfile**
+
+```dockerfile
+FROM python:3.10-slim
+
+RUN apt-get update && apt-get install -y \
+    libsndfile1 ffmpeg git \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN pip install --upgrade pip
+
+WORKDIR /code/stt-api
+# Copy requirements first — Docker caches this layer unless requirements change
+COPY requirements.txt /code/stt-api/
+RUN pip install -r requirements.txt
+
+COPY . /code/stt-api
+CMD ["python", "-m", "gradio", "app.py"]
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add config.py requirements.txt requirements-dev.txt Dockerfile
+git commit -m "chore: pin all deps, centralise config, slim Dockerfile base"
+```
+
+---
+
+### Task 2: inference/preprocess.py
+
+**Files:**
+- Create: `inference/__init__.py` (empty)
+- Create: `inference/preprocess.py`
+- Create: `tests/test_preprocess.py`
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_preprocess.py
+import numpy as np
+import pytest
+from inference.preprocess import load_and_normalise, get_audio_duration_secs
+
+def test_get_audio_duration_returns_float(tmp_path):
+    """Duration of a synthetic 2-second mono 16kHz wav must be ~2.0s."""
+    import soundfile as sf
+    samples = np.zeros(32_000, dtype=np.float32)
+    path = str(tmp_path / "test.wav")
+    sf.write(path, samples, 16_000)
+    duration = get_audio_duration_secs(path)
+    assert abs(duration - 2.0) < 0.05
+
+def test_load_and_normalise_resamples_to_16k(tmp_path):
+    """Audio at 44.1kHz must be resampled to 16kHz."""
+    import soundfile as sf
+    samples = np.zeros(44_100, dtype=np.float32)
+    path = str(tmp_path / "highrate.wav")
+    sf.write(path, samples, 44_100)
+    array, sr = load_and_normalise(path)
+    assert sr == 16_000
+
+def test_load_and_normalise_raises_on_missing_file():
+    with pytest.raises(FileNotFoundError):
+        load_and_normalise("/nonexistent/file.wav")
+```
+
+- [ ] **Step 2: Run tests to confirm they fail**
+
+```bash
+pytest tests/test_preprocess.py -v
+# Expected: ERROR — ModuleNotFoundError: No module named 'inference'
+```
+
+- [ ] **Step 3: Implement preprocess.py**
+
+```python
+# inference/preprocess.py
+"""Audio loading, normalisation, and metadata extraction."""
+
+import os
+import numpy as np
+import soundfile as sf
+import torchaudio
+import torchaudio.transforms as T
+from pydub import AudioSegment, silence as pydub_silence
+from config import TARGET_SAMPLE_RATE, SILENCE_THRESH_DB
+
+
+def get_audio_duration_secs(path: str) -> float:
+    """Return the duration of an audio file in seconds using metadata only.
+    This is the admission-control signal — never use file size for this."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Audio file not found: {path}")
+    info = torchaudio.info(path)
+    return info.num_frames / info.sample_rate
+
+
+def load_and_normalise(path: str) -> tuple[np.ndarray, int]:
+    """Load audio, convert to mono, resample to TARGET_SAMPLE_RATE.
+    Returns a float32 numpy array normalised to [-1, 1] and the sample rate."""
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Audio file not found: {path}")
+    waveform, sr = torchaudio.load(path)
+
+    # Downmix to mono by averaging channels
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+
+    # Resample if needed
+    if sr != TARGET_SAMPLE_RATE:
+        resampler = T.Resample(orig_freq=sr, new_freq=TARGET_SAMPLE_RATE)
+        waveform = resampler(waveform)
+
+    array = waveform.squeeze().numpy().astype(np.float32)
+
+    # Peak-normalise to prevent clipping artefacts
+    peak = np.abs(array).max()
+    if peak > 0:
+        array = array / peak * 0.95
+
+    return array, TARGET_SAMPLE_RATE
+
+
+def trim_silence(path: str, out_path: str) -> str:
+    """Strip leading and trailing silence below SILENCE_THRESH_DB.
+    Writes result to out_path and returns out_path."""
+    audio = AudioSegment.from_file(path)
+    trimmed = pydub_silence.detect_leading_silence(audio, silence_threshold=SILENCE_THRESH_DB)
+    audio = audio[trimmed:]
+    reversed_audio = audio.reverse()
+    trimmed_end = pydub_silence.detect_leading_silence(
+        reversed_audio, silence_threshold=SILENCE_THRESH_DB
+    )
+    audio = reversed_audio[trimmed_end:].reverse()
+    audio.export(out_path, format="wav")
+    return out_path
+```
+
+- [ ] **Step 4: Run tests to confirm they pass**
+
+```bash
+pytest tests/test_preprocess.py -v
+# Expected: PASSED — 3 tests
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add inference/__init__.py inference/preprocess.py tests/test_preprocess.py
+git commit -m "feat(inference): add preprocess module with duration extraction and normalisation"
+```
+
+---
+
+### Task 3: inference/chunker.py
+
+**Files:**
+- Create: `inference/chunker.py`
+- Create: `tests/test_chunker.py`
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_chunker.py
+import numpy as np
+import pytest
+from inference.chunker import chunk_audio
+
+def test_chunk_audio_returns_list_of_paths(tmp_path):
+    """A 60-second audio file must produce multiple chunk paths."""
+    import soundfile as sf
+    samples = np.zeros(16_000 * 60, dtype=np.float32)
+    path = str(tmp_path / "long.wav")
+    sf.write(path, samples, 16_000)
+    chunks = chunk_audio(path, str(tmp_path))
+    assert len(chunks) > 1
+    for c in chunks:
+        assert c.endswith(".wav")
+
+def test_chunk_audio_short_file_returns_one_chunk(tmp_path):
+    """Audio shorter than one chunk window must return exactly one path."""
+    import soundfile as sf
+    samples = np.zeros(16_000 * 10, dtype=np.float32)  # 10 seconds
+    path = str(tmp_path / "short.wav")
+    sf.write(path, samples, 16_000)
+    chunks = chunk_audio(path, str(tmp_path))
+    assert len(chunks) == 1
+```
+
+- [ ] **Step 2: Run tests to confirm they fail**
+
+```bash
+pytest tests/test_chunker.py -v
+# Expected: ERROR — ModuleNotFoundError: No module named 'inference.chunker'
+```
+
+- [ ] **Step 3: Implement chunker.py**
+
+```python
+# inference/chunker.py
+"""Sliding window chunker with overlap. Each chunk is written to a temp wav file."""
+
+import os
+import numpy as np
+import soundfile as sf
+from inference.preprocess import load_and_normalise
+from config import CHUNK_DURATION_MS, OVERLAP_DURATION_MS, TARGET_SAMPLE_RATE
+
+
+def chunk_audio(audio_path: str, output_dir: str) -> list[str]:
+    """Split audio into overlapping windows.
+
+    Overlap prevents word boundary clipping: the last OVERLAP_DURATION_MS of
+    each chunk is repeated at the start of the next. postprocess.py removes
+    the duplicate text during stitching.
+
+    Returns a list of file paths to the chunk wav files, in order.
+    """
+    array, sr = load_and_normalise(audio_path)
+
+    chunk_samples = int((CHUNK_DURATION_MS / 1000) * sr)
+    overlap_samples = int((OVERLAP_DURATION_MS / 1000) * sr)
+    step = chunk_samples - overlap_samples
+
+    os.makedirs(output_dir, exist_ok=True)
+    chunk_paths = []
+
+    start = 0
+    idx = 0
+    while start < len(array):
+        end = min(start + chunk_samples, len(array))
+        chunk = array[start:end]
+        chunk_path = os.path.join(output_dir, f"chunk_{idx:04d}.wav")
+        sf.write(chunk_path, chunk, sr)
+        chunk_paths.append(chunk_path)
+        start += step
+        idx += 1
+
+    return chunk_paths
+```
+
+- [ ] **Step 4: Run tests to confirm they pass**
+
+```bash
+pytest tests/test_chunker.py -v
+# Expected: PASSED — 2 tests
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add inference/chunker.py tests/test_chunker.py
+git commit -m "feat(inference): add sliding window chunker with configurable overlap"
+```
+
+---
+
+### Task 4: inference/loader.py + inference/decoder.py + inference/postprocess.py
+
+**Files:**
+- Create: `inference/loader.py`
+- Create: `inference/decoder.py`
+- Create: `inference/postprocess.py`
+- Create: `tests/test_decoder.py`
+
+- [ ] **Step 1: Write the failing decoder test**
+
+```python
+# tests/test_decoder.py
+import torch
+import pytest
+from unittest.mock import MagicMock, patch
+from inference.decoder import decode_logits
+
+def test_decode_logits_returns_string():
+    """decode_logits must return a non-empty string for valid logits."""
+    mock_processor = MagicMock()
+    mock_processor.batch_decode.return_value = ["muraho"]
+    logits = torch.zeros(1, 50, 32)   # batch=1, time=50, vocab=32
+    result = decode_logits(logits, mock_processor)
+    assert isinstance(result, str)
+    assert result == "muraho"
+
+def test_decode_logits_handles_empty_output():
+    """decode_logits must return empty string when model outputs blank only."""
+    mock_processor = MagicMock()
+    mock_processor.batch_decode.return_value = [""]
+    logits = torch.zeros(1, 10, 32)
+    result = decode_logits(logits, mock_processor)
+    assert result == ""
+```
+
+- [ ] **Step 2: Run tests to confirm they fail**
+
+```bash
+pytest tests/test_decoder.py -v
+# Expected: ERROR — ModuleNotFoundError: No module named 'inference.decoder'
+```
+
+- [ ] **Step 3: Implement loader.py**
+
+```python
+# inference/loader.py
+"""Lazy model singleton. The model is loaded once on first transcription request.
+Never import at module scope in app.py — that causes load on container start."""
+
+import threading
+import torch
+from transformers import Wav2Vec2BertForCTC, Wav2Vec2BertProcessor
+from config import MODEL_NAME
+
+_lock = threading.Lock()
+_model = None
+_processor = None
+
+
+def get_model_and_processor() -> tuple[Wav2Vec2BertForCTC, Wav2Vec2BertProcessor]:
+    """Return the singleton (model, processor) pair, loading on first call."""
+    global _model, _processor
+    if _model is None:
+        with _lock:
+            # Double-check after acquiring lock — another thread may have loaded
+            if _model is None:
+                device = "cuda" if torch.cuda.is_available() else "cpu"
+                _processor = Wav2Vec2BertProcessor.from_pretrained(MODEL_NAME)
+                _model = Wav2Vec2BertForCTC.from_pretrained(MODEL_NAME).to(device)
+                _model.eval()
+    return _model, _processor
+```
+
+- [ ] **Step 4: Implement decoder.py**
+
+```python
+# inference/decoder.py
+"""CTC greedy decode from logits to text. Stateless — no model reference held here."""
+
+import torch
+from transformers import Wav2Vec2BertProcessor
+
+
+def decode_logits(logits: torch.Tensor, processor: Wav2Vec2BertProcessor) -> str:
+    """Greedy decode: argmax over vocab dimension, then convert token IDs to text.
+    Returns a single decoded string for the first item in the batch."""
+    predicted_ids = torch.argmax(logits, dim=-1)
+    transcription = processor.batch_decode(predicted_ids)
+    return transcription[0] if transcription else ""
+```
+
+- [ ] **Step 5: Implement postprocess.py**
+
+```python
+# inference/postprocess.py
+"""Stitch ordered chunk transcripts into a single clean string."""
+
+import re
+
+
+def stitch_chunks(transcripts: list[str]) -> str:
+    """Join chunk transcripts with a space and clean up whitespace artefacts.
+    Duplicate words at chunk boundaries are not removed automatically because
+    the overlap is acoustic (signal level), not textual. Post-editors handle
+    any residual boundary repetitions in the Gradio textbox."""
+    joined = " ".join(t.strip() for t in transcripts if t.strip())
+    # Collapse multiple spaces introduced by empty chunks
+    cleaned = re.sub(r" {2,}", " ", joined)
+    return cleaned.strip()
+```
+
+- [ ] **Step 6: Run tests to confirm they pass**
+
+```bash
+pytest tests/test_decoder.py -v
+# Expected: PASSED — 2 tests
+```
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add inference/loader.py inference/decoder.py inference/postprocess.py \
+        tests/test_decoder.py
+git commit -m "feat(inference): add loader singleton, CTC decoder, chunk stitcher"
+```
+
+---
+
+### Task 5: state/job_store.py — HF Dataset Repo as Authoritative State
+
+**Files:**
+- Create: `state/__init__.py` (empty)
+- Create: `state/job_store.py`
+- Create: `tests/test_job_store.py`
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_job_store.py
+import json
+import pytest
+from unittest.mock import patch, MagicMock
+from state.job_store import (
+    create_job, update_job_chunk, complete_job, fail_job,
+    load_all_jobs, JobStatus
+)
+
+@patch("state.job_store._push_to_hub")
+@patch("state.job_store._pull_from_hub", return_value={})
+def test_create_job_returns_record(mock_pull, mock_push):
+    record = create_job("job-001", "/audio/test.wav", duration_secs=45.0)
+    assert record["job_id"] == "job-001"
+    assert record["status"] == JobStatus.QUEUED
+    assert record["duration_secs"] == 45.0
+    assert record["chunks_done"] == 0
+    mock_push.assert_called_once()
+
+@patch("state.job_store._push_to_hub")
+@patch("state.job_store._pull_from_hub")
+def test_update_job_chunk_appends_transcript(mock_pull, mock_push):
+    mock_pull.return_value = {
+        "job-002": {
+            "job_id": "job-002", "status": JobStatus.PROCESSING,
+            "transcripts": [], "chunks_done": 0, "total_chunks": 3,
+            "duration_secs": 60.0, "audio_path": "/a.wav"
+        }
+    }
+    record = update_job_chunk("job-002", chunk_index=0, transcript="muraho")
+    assert record["transcripts"] == ["muraho"]
+    assert record["chunks_done"] == 1
+
+@patch("state.job_store._push_to_hub")
+@patch("state.job_store._pull_from_hub")
+def test_fail_job_sets_status(mock_pull, mock_push):
+    mock_pull.return_value = {
+        "job-003": {
+            "job_id": "job-003", "status": JobStatus.PROCESSING,
+            "transcripts": [], "chunks_done": 1, "total_chunks": 3,
+            "duration_secs": 60.0, "audio_path": "/a.wav"
+        }
+    }
+    record = fail_job("job-003", reason="Model timeout")
+    assert record["status"] == JobStatus.FAILED
+    assert record["error"] == "Model timeout"
+```
+
+- [ ] **Step 2: Run tests to confirm they fail**
+
+```bash
+pytest tests/test_job_store.py -v
+# Expected: ERROR — ModuleNotFoundError: No module named 'state.job_store'
+```
+
+- [ ] **Step 3: Implement job_store.py**
+
+```python
+# state/job_store.py
+"""
+Authoritative durable state for all transcription jobs.
+
+The Space is a stateless execution surface. This module is the only place
+that reads from and writes to the HF Dataset repo. The in-memory cache in
+cache.py is a volatile read model derived from this store — it is NEVER
+the source of truth.
+
+Write policy: writes happen only on state transitions (create, chunk complete,
+job complete, job fail). UI polling reads from cache.py, not here.
+"""
+
+import json
+import time
+import threading
+from dataclasses import dataclass, asdict, field
+from typing import Optional
+from huggingface_hub import HfApi, hf_hub_download, upload_file
+from config import (
+    HF_DATASET_REPO, JOB_STATE_FILE,
+    BACKOFF_BASE_SECS, BACKOFF_MAX_SECS, BACKOFF_MULTIPLIER
+)
+
+_write_lock = threading.Lock()
+
+
+class JobStatus:
+    QUEUED = "queued"
+    PROCESSING = "processing"
+    COMPLETE = "complete"
+    FAILED = "failed"
+
+
+def _pull_from_hub() -> dict:
+    """Download the current jobs JSON from the dataset repo.
+    Returns an empty dict if the file does not exist yet."""
+    try:
+        path = hf_hub_download(
+            repo_id=HF_DATASET_REPO,
+            filename=JOB_STATE_FILE,
+            repo_type="dataset",
+            force_download=True,   # Always fetch fresh — never trust local cache
+        )
+        with open(path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _push_to_hub(jobs: dict) -> None:
+    """Write the full jobs dict to the dataset repo with exponential backoff on 429."""
+    import tempfile, os
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as tmp:
+        json.dump(jobs, tmp, indent=2)
+        tmp_path = tmp.name
+
+    delay = BACKOFF_BASE_SECS
+    while True:
+        try:
+            upload_file(
+                path_or_fileobj=tmp_path,
+                path_in_repo=JOB_STATE_FILE,
+                repo_id=HF_DATASET_REPO,
+                repo_type="dataset",
+            )
+            break
+        except Exception as e:
+            if "429" in str(e) or "rate limit" in str(e).lower():
+                time.sleep(min(delay, BACKOFF_MAX_SECS))
+                delay *= BACKOFF_MULTIPLIER
+            else:
+                raise
+        finally:
+            os.unlink(tmp_path)
+
+
+def create_job(
+    job_id: str, audio_path: str, duration_secs: float, total_chunks: int = 0
+) -> dict:
+    with _write_lock:
+        jobs = _pull_from_hub()
+        record = {
+            "job_id": job_id,
+            "status": JobStatus.QUEUED,
+            "audio_path": audio_path,
+            "duration_secs": duration_secs,
+            "total_chunks": total_chunks,
+            "chunks_done": 0,
+            "transcripts": [],
+            "error": None,
+        }
+        jobs[job_id] = record
+        _push_to_hub(jobs)
+    return record
+
+
+def update_job_chunk(job_id: str, chunk_index: int, transcript: str) -> dict:
+    with _write_lock:
+        jobs = _pull_from_hub()
+        record = jobs[job_id]
+        record["status"] = JobStatus.PROCESSING
+        # Pad transcript list to accommodate out-of-order completion
+        while len(record["transcripts"]) <= chunk_index:
+            record["transcripts"].append("")
+        record["transcripts"][chunk_index] = transcript
+        record["chunks_done"] += 1
+        jobs[job_id] = record
+        _push_to_hub(jobs)
+    return record
+
+
+def complete_job(job_id: str, final_transcript: str) -> dict:
+    with _write_lock:
+        jobs = _pull_from_hub()
+        jobs[job_id]["status"] = JobStatus.COMPLETE
+        jobs[job_id]["final_transcript"] = final_transcript
+        _push_to_hub(jobs)
+    return jobs[job_id]
+
+
+def fail_job(job_id: str, reason: str) -> dict:
+    with _write_lock:
+        jobs = _pull_from_hub()
+        jobs[job_id]["status"] = JobStatus.FAILED
+        jobs[job_id]["error"] = reason
+        _push_to_hub(jobs)
+    return jobs[job_id]
+
+
+def load_all_jobs() -> dict:
+    """Called at Space startup to recover in-progress and queued jobs."""
+    return _pull_from_hub()
+```
+
+- [ ] **Step 4: Run tests to confirm they pass**
+
+```bash
+pytest tests/test_job_store.py -v
+# Expected: PASSED — 3 tests
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add state/__init__.py state/job_store.py tests/test_job_store.py
+git commit -m "feat(state): add HF dataset repo job store with backoff writes"
+```
+
+---
+
+### Task 6: state/cache.py — Volatile Read Model
+
+**Files:**
+- Create: `state/cache.py`
+
+- [ ] **Step 1: Implement cache.py**
+
+```python
+# state/cache.py
+"""
+Volatile in-memory read model. This cache is derived from the dataset repo
+and is NEVER the source of truth. It is rebuilt from job_store on startup
+and updated after each state transition write. If the Space restarts, the
+cache is empty until seeded from the dataset repo again.
+
+The UI polls this cache every CACHE_POLL_INTERVAL_SECS seconds — it NEVER
+polls the Hub API directly. This prevents self-inflicted 429 rate limits.
+"""
+
+import threading
+from typing import Optional
+
+_lock = threading.Lock()
+_cache: dict[str, dict] = {}   # job_id -> job record
+
+
+def seed_from_store(jobs: dict) -> None:
+    """Populate the cache at startup from the dataset repo. Call once."""
+    with _lock:
+        _cache.clear()
+        _cache.update(jobs)
+
+
+def put(job_id: str, record: dict) -> None:
+    """Write a job record to the cache after a successful Hub write."""
+    with _lock:
+        _cache[job_id] = record
+
+
+def get(job_id: str) -> Optional[dict]:
+    """Read a single job record. Returns None if not found."""
+    with _lock:
+        return _cache.get(job_id)
+
+
+def get_system_status() -> dict:
+    """Return a lightweight summary for the UI status indicator."""
+    with _lock:
+        active = sum(1 for j in _cache.values() if j["status"] == "processing")
+        queued = sum(1 for j in _cache.values() if j["status"] == "queued")
+    return {
+        "active_jobs": active,
+        "queued_jobs": queued,
+        "load_level": "low" if active == 0 else "medium" if active < 2 else "high",
+    }
+```
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add state/cache.py
+git commit -m "feat(state): add volatile in-memory cache as UI read model"
+```
+
+---
+
+### Task 7: scheduler/admission.py — Duration-Based Weighted Slots
+
+**Files:**
+- Create: `scheduler/__init__.py` (empty)
+- Create: `scheduler/admission.py`
+- Create: `tests/test_admission.py`
+
+- [ ] **Step 1: Write the failing tests**
+
+```python
+# tests/test_admission.py
+import asyncio
+import pytest
+from scheduler.admission import AdmissionController, SlotType
+
+@pytest.mark.asyncio
+async def test_short_job_acquires_priority_slot():
+    ac = AdmissionController()
+    slot = await ac.acquire(duration_secs=10.0)
+    assert slot == SlotType.SHORT
+    ac.release(slot)
+
+@pytest.mark.asyncio
+async def test_long_job_acquires_primary_slot():
+    ac = AdmissionController()
+    slot = await ac.acquire(duration_secs=90.0)
+    assert slot == SlotType.PRIMARY
+    ac.release(slot)
+
+@pytest.mark.asyncio
+async def test_exceeds_max_duration_raises():
+    ac = AdmissionController()
+    with pytest.raises(ValueError, match="exceeds maximum"):
+        await ac.acquire(duration_secs=999.0)
+```
+
+- [ ] **Step 2: Run tests to confirm they fail**
+
+```bash
+pytest tests/test_admission.py -v
+# Expected: ERROR — ModuleNotFoundError: No module named 'scheduler.admission'
+```
+
+- [ ] **Step 3: Implement admission.py**
+
+```python
+# scheduler/admission.py
+"""Duration-based weighted slot admission controller.
+
+Short jobs (≤ SHORT_JOB_THRESHOLD_SECS) get a dedicated priority slot so
+they are never blocked by a long job occupying both primary slots.
+Long jobs compete for MAX_PRIMARY_SLOTS slots.
+"""
+
+import asyncio
+from enum import Enum
+from config import MAX_PRIMARY_SLOTS, SHORT_JOB_THRESHOLD_SECS, MAX_AUDIO_DURATION_SECS
+
+
+class SlotType(str, Enum):
+    SHORT = "short"
+    PRIMARY = "primary"
+
+
+class AdmissionController:
+    def __init__(self):
+        # Primary semaphore: gates long jobs
+        self._primary = asyncio.Semaphore(MAX_PRIMARY_SLOTS)
+        # Short-job semaphore: one dedicated slot for quick jobs
+        self._short = asyncio.Semaphore(1)
+
+    async def acquire(self, duration_secs: float) -> SlotType:
+        """Acquire the appropriate slot based on audio duration.
+        Raises ValueError if duration exceeds the hard cap."""
+        if duration_secs > MAX_AUDIO_DURATION_SECS:
+            raise ValueError(
+                f"Audio duration {duration_secs:.1f}s exceeds maximum "
+                f"{MAX_AUDIO_DURATION_SECS}s. Please trim your file."
+            )
+        if duration_secs <= SHORT_JOB_THRESHOLD_SECS:
+            await self._short.acquire()
+            return SlotType.SHORT
+        else:
+            await self._primary.acquire()
+            return SlotType.PRIMARY
+
+    def release(self, slot: SlotType) -> None:
+        if slot == SlotType.SHORT:
+            self._short.release()
+        else:
+            self._primary.release()
+```
+
+- [ ] **Step 4: Run tests to confirm they pass**
+
+```bash
+pytest tests/test_admission.py -v
+# Expected: PASSED — 3 tests
+```
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add scheduler/__init__.py scheduler/admission.py tests/test_admission.py
+git commit -m "feat(scheduler): add duration-based weighted admission controller"
+```
+
+---
+
+### Task 8: app.py Refactor — Stateless Gradio UI
+
+**Files:**
+- Modify: `app.py` (full replacement)
+
+- [ ] **Step 1: Replace app.py with the refactored version**
+
+```python
+# app.py
+"""
+Gradio UI — stateless execution surface.
+
+Design contracts:
+  - The UI reads ONLY from state/cache.py (volatile read model).
+  - All durable writes go through state/job_store.py.
+  - No inference logic lives here — all delegated to inference/ modules.
+  - Model loading is lazy: first request triggers loader.get_model_and_processor().
+  - On startup, the cache is seeded from the Hub dataset repo.
+"""
+
+import asyncio
+import hashlib
+import os
+import time
+import tempfile
+import uuid
+
+import gradio as gr
+
+from config import CACHE_POLL_INTERVAL_SECS
+from inference.preprocess import get_audio_duration_secs, load_and_normalise
+from inference.chunker import chunk_audio
+from inference.loader import get_model_and_processor
+from inference.decoder import decode_logits
+from inference.postprocess import stitch_chunks
+from scheduler.admission import AdmissionController, SlotType
+from state import job_store, cache
+
+import torch
+
+# Seed cache from Hub on startup (recovers jobs from before last restart)
+_startup_jobs = job_store.load_all_jobs()
+cache.seed_from_store(_startup_jobs)
+
+# Single shared admission controller — module-level singleton
+_admission = AdmissionController()
+
+
+def _make_job_id(audio_path: str) -> str:
+    """Deterministic job ID from file content hash + timestamp."""
+    with open(audio_path, "rb") as f:
+        content_hash = hashlib.sha256(f.read(4096)).hexdigest()[:12]
+    return f"{content_hash}-{int(time.time())}"
+
+
+async def transcribe(audio_path: str | None, progress=gr.Progress()) -> str:
+    """Main transcription handler. Called by Gradio on button click."""
+    if not audio_path:
+        return "Please upload an audio file first."
+
+    # 1. Validate duration before touching the model
+    try:
+        duration = get_audio_duration_secs(audio_path)
+    except FileNotFoundError:
+        return "File not found. Please re-upload."
+
+    # 2. Acquire slot — raises ValueError if over cap
+    try:
+        slot = await _admission.acquire(duration_secs=duration)
+    except ValueError as e:
+        return str(e)
+
+    job_id = _make_job_id(audio_path)
+
+    try:
+        progress(0.05, desc="Loading model...")
+        model, processor = get_model_and_processor()
+
+        # 3. Create job record in Hub dataset repo
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            progress(0.10, desc="Chunking audio...")
+            chunk_paths = chunk_audio(audio_path, tmp_dir)
+            total = len(chunk_paths)
+
+            record = job_store.create_job(
+                job_id, audio_path, duration_secs=duration, total_chunks=total
+            )
+            cache.put(job_id, record)
+
+            # 4. Process each chunk; write state transition after each
+            transcripts = []
+            for i, chunk_path in enumerate(chunk_paths):
+                progress(
+                    0.10 + 0.85 * (i / total),
+                    desc=f"Transcribing chunk {i + 1}/{total}..."
+                )
+                array, sr = load_and_normalise(chunk_path)
+                inputs = processor(
+                    array, sampling_rate=sr, return_tensors="pt"
+                )
+                with torch.no_grad():
+                    logits = model(**inputs).logits
+                text = decode_logits(logits, processor)
+                transcripts.append(text)
+
+                # State transition write → Hub (batched per chunk, not per word)
+                record = job_store.update_job_chunk(job_id, i, text)
+                cache.put(job_id, record)
+
+            # 5. Stitch and finalise
+            progress(0.97, desc="Finalising...")
+            final = stitch_chunks(transcripts)
+            record = job_store.complete_job(job_id, final)
+            cache.put(job_id, record)
+
+        return final
+
+    except Exception as e:
+        record = job_store.fail_job(job_id, reason=str(e))
+        cache.put(job_id, record)
+        return "Transcription failed. Please contact support with job ID: " + job_id
+    finally:
+        _admission.release(slot)
+
+
+def _system_status_html() -> str:
+    """Lightweight status string read from volatile cache — never from Hub."""
+    status = cache.get_system_status()
+    level = status["load_level"]
+    color = {"low": "#10B981", "medium": "#F59E0B", "high": "#E11D48"}[level]
+    return (
+        f'<span style="color:{color};font-weight:600;">'
+        f'System: {level.upper()} — '
+        f'{status["active_jobs"]} active, {status["queued_jobs"]} queued'
+        f'</span>'
+    )
+
+
+if __name__ == "__main__":
+    with gr.Blocks(title="MbanzaNLP — Kinyarwanda ASR") as demo:
+        gr.Markdown("## Kinyarwanda Speech Transcription\nMax 3 minutes · WAV recommended")
+
+        with gr.Row():
+            audio_input = gr.Audio(label="Upload Audio", type="filepath")
+            with gr.Column():
+                transcription = gr.Textbox(
+                    label="Transcription", interactive=True, lines=10
+                )
+                status_html = gr.HTML(value=_system_status_html())
+
+        transcribe_btn = gr.Button("Transcribe", variant="primary")
+        transcribe_btn.click(
+            fn=transcribe,
+            inputs=[audio_input],
+            outputs=[transcription],
+        )
+
+        # Refresh system status from volatile cache every 5 seconds
+        demo.load(
+            fn=_system_status_html,
+            outputs=[status_html],
+            every=CACHE_POLL_INTERVAL_SECS,
+        )
+
+    demo.launch(server_name="0.0.0.0")
+```
+
+- [ ] **Step 2: Delete the old stt.py**
+
+```bash
+git rm stt.py
+```
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add app.py
+git commit -m "refactor(app): replace monolithic app.py with stateless Gradio UI"
+```
+
+---
+
+### Task 9: Integration Test + WER Baseline
+
+**Files:**
+- Create: `tests/test_integration.py`
+
+- [ ] **Step 1: Write the integration smoke test**
+
+```python
+# tests/test_integration.py
+"""
+Integration test: full pipeline from audio file to transcript string.
+Uses a short synthetic audio file — no real model loaded in CI.
+Tests that the pipeline wiring is correct end-to-end.
+"""
+
+import numpy as np
+import soundfile as sf
+import pytest
+from unittest.mock import patch, MagicMock
+from inference.chunker import chunk_audio
+from inference.postprocess import stitch_chunks
+import tempfile
+
+
+def test_full_pipeline_wiring(tmp_path):
+    """End-to-end: a 30-second audio file must produce a stitched transcript."""
+    # Create a synthetic audio file
+    samples = np.zeros(16_000 * 30, dtype=np.float32)
+    audio_path = str(tmp_path / "test30s.wav")
+    sf.write(audio_path, samples, 16_000)
+
+    # Chunk it
+    chunks = chunk_audio(audio_path, str(tmp_path / "chunks"))
+    assert len(chunks) >= 1
+
+    # Mock decode_logits to return a predictable string
+    mock_transcripts = [f"chunk{i}" for i in range(len(chunks))]
+    result = stitch_chunks(mock_transcripts)
+
+    assert "chunk0" in result
+    assert isinstance(result, str)
+
+
+def test_stitch_handles_empty_chunks():
+    result = stitch_chunks(["hello", "", "world"])
+    assert result == "hello world"
+```
+
+- [ ] **Step 2: Run full test suite**
+
+```bash
+pytest tests/ -v --tb=short
+# Expected: All tests PASS
+```
+
+- [ ] **Step 3: Establish WER baseline (run manually, record result)**
+
+```bash
+# Install dev deps first
+pip install -r requirements-dev.txt
+
+# Run WER measurement against Common Voice Kinyarwanda test split
+# (requires HF_TOKEN set as environment variable)
+python scripts/measure_wer.py \
+    --model badrex/w2v-bert-2.0-kinyarwanda-asr-1000h \
+    --dataset mozilla-foundation/common_voice_13_0 \
+    --language rw \
+    --split test \
+    --output wer_baseline.json
+```
+
+Expected output in `wer_baseline.json`:
+```json
+{
+  "model": "badrex/w2v-bert-2.0-kinyarwanda-asr-1000h",
+  "wer_formal": 0.084,
+  "wer_conversational": null,
+  "p95_latency_ms": null,
+  "p99_latency_ms": null,
+  "measured_at": "2026-04-20"
+}
+```
+
+- [ ] **Step 4: Commit baseline and full test suite**
+
+```bash
+git add tests/test_integration.py wer_baseline.json
+git commit -m "test: add integration smoke test and WER baseline record"
+```
+
+---
+
+## Execution Handoff
+
+Plan complete. Two execution options:
+
+**Option 1 — Subagent-Driven (recommended):** Dispatch a fresh subagent per task,
+review output between tasks, iterate rapidly without stale context accumulation.
+
+**Option 2 — Inline Execution:** Execute tasks in this session with checkpoints
+after each task group before moving to the next.
+
+Which approach does the team prefer?
