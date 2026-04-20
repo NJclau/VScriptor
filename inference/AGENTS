@@ -1,0 +1,74 @@
+# inference/AGENTS.md
+# Codex: this overrides root guidance for work inside the inference/ package.
+# Read the root AGENTS.md first. Then apply the additional rules below.
+
+---
+
+## Package Responsibility
+
+Every file in this package is stateless and side-effect-free with respect to durable
+storage. Inference modules do NOT write to the Hub, do NOT call `state/job_store.py`,
+and do NOT hold model references as module-level globals (loader.py excepted, where the
+lazy singleton is intentional and documented). If you find yourself importing from
+`state/` inside any file in `inference/`, stop — you are in the wrong direction.
+
+---
+
+## Module Contracts
+
+**loader.py** owns the model singleton. The model is loaded once, on the first call
+to `get_model_and_processor()`. The lazy init uses a `threading.Lock` with
+double-checked locking: check if `_model is None` before acquiring the lock (fast
+path), then check again inside the lock (safe path for concurrent first calls). Never
+move model loading to module import time — that causes load on container start before
+Gradio is even initialised.
+
+**preprocess.py** must return `(np.ndarray, int)` from `load_and_normalise()` where
+the int is always `TARGET_SAMPLE_RATE` from config. The array must be float32,
+mono, peak-normalised to 0.95. `get_audio_duration_secs()` must use `torchaudio.info()`
+only — it must NOT load the audio into memory. Duration reading must be fast and
+metadata-only because it runs before slot acquisition.
+
+**chunker.py** must write each chunk to disk as a WAV file inside the `output_dir`
+argument. It must NOT return in-memory arrays because the audio buffer for a 3-minute
+file at 16kHz float32 is ~57MB, and holding multiple overlapping windows simultaneously
+would push memory pressure past safe limits on a 16GB free-tier Space. The overlap
+exists at the signal level only — do not attempt to deduplicate text at chunk
+boundaries. That is not chunker's responsibility.
+
+**decoder.py** is intentionally thin. Its entire purpose is to translate a logits
+tensor to a string using the processor's `batch_decode`. It knows nothing about files,
+models, jobs, or chunks. Keep it that way. If beam search replaces greedy decode in a
+future version, only this file changes.
+
+**postprocess.py** joins transcripts with a single space and collapses multiple spaces
+from empty-chunk blank output. It does NOT attempt punctuation restoration,
+capitalisation, or language model rescoring in Version 2.0. Do not add NLP
+post-processing here without a separate task and WER gate.
+
+---
+
+## Test Requirements for This Package
+
+Every function in every file must have at least one test that covers the happy path and
+at least one test that covers the primary failure mode. For `preprocess.py`, the
+failure mode is a missing file. For `chunker.py`, the failure mode is audio shorter
+than one chunk window (must return exactly one chunk, not zero). For `decoder.py`, the
+failure mode is blank model output (must return empty string, not raise). For
+`postprocess.py`, the failure mode is a list containing empty strings (must not include
+double spaces in output).
+
+All tests must use synthetic audio generated with `numpy` and `soundfile`. Do not
+commit test audio files to the repository. Synthetic files must be created in pytest
+`tmp_path` fixtures and cleaned up automatically.
+
+---
+
+## Running Tests for This Package Only
+
+```bash
+pytest tests/test_preprocess.py tests/test_chunker.py tests/test_decoder.py -v
+```
+
+Expected: all pass, no network calls, no GPU required. These tests must run on a
+machine with no NVIDIA GPU and no HF token set.
