@@ -1,0 +1,18 @@
+version: '3.7'
+
+services:
+  asr-long-format:
+    build: .
+    command: gradio app.py
+    restart: unless-stopped
+    runtime: nvidia  #use when you are using an nvidia gpu else comment this section
+    ports:
+      - "7860:7860"
+    networks:
+      - infrastructure_default
+   
+
+
+networks:
+  infrastructure_default:
+    external: true
