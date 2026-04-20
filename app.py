@@ -7,6 +7,7 @@ from inference.postprocess import stitch_chunk_transcripts
 from inference.preprocess import prepare_audio_for_transcription
 
 
+
 def transcription_text(audio_input):
     if audio_input is None or audio_input == "":
         return "please input the audio first"
