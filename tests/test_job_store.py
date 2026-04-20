@@ -1,6 +1,5 @@
 from unittest.mock import patch
 
-import pytest
 
 from state import job_store
 
