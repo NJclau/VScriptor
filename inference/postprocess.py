@@ -1,7 +1,7 @@
-"""Postprocessing utilities."""
+"""Post-processing helpers for chunk transcripts."""
 
 
-def stitch_chunks(chunk_transcripts: list[str]) -> str:
-    """Join chunk transcripts into a final string."""
-    cleaned = [part.strip() for part in chunk_transcripts if part and part.strip()]
-    return " ".join(cleaned).strip()
+def stitch_chunk_transcripts(transcripts: list[str]) -> str:
+    """Join chunk transcripts and normalize whitespace."""
+    joined_text = " ".join(text.strip() for text in transcripts if text)
+    return " ".join(joined_text.split())
