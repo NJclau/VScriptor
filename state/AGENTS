@@ -1,0 +1,101 @@
+# state/AGENTS.md
+# Codex: this overrides root guidance for work inside the state/ package.
+# Read the root AGENTS.md first. Then apply the additional rules below.
+
+---
+
+## Package Responsibility
+
+This package is the most sensitive in the codebase. Every correctness property of the
+system's restart-resilience depends on these two files being implemented exactly right.
+Read this file more carefully than any other AGENTS.md in the repository.
+
+---
+
+## The Authoritative State Rule — One More Time
+
+The dataset repo is the source of truth. The in-memory cache is a volatile read model.
+These are not equivalent and they are not interchangeable. If you are writing a code
+path where the cache is consulted to make a decision that affects a job's lifecycle
+(whether to process it, whether to skip a chunk, whether to retry), you are making the
+cache authoritative. That is a bug. The cache exists only so the UI can read job state
+without hitting the Hub API every 5 seconds.
+
+The test that distinguishes authoritative from non-authoritative: if the Space
+restarts right now and the cache is empty, can the system reconstruct the correct
+current state by reading from the Hub? If yes, the cache is a read model. If no,
+something that should be in the Hub is only in the cache. Fix it.
+
+---
+
+## job_store.py — Specific Implementation Rules
+
+The pull-mutate-push pattern inside every write function is intentional and must not
+be simplified. The sequence is: acquire `_write_lock`, call `_pull_from_hub()` to get
+the current state, apply the mutation to the in-memory copy, call `_push_to_hub()` to
+write the full updated state back. The lock prevents two concurrent chunk writes from
+interleaving their pull-mutate-push cycles, which would cause one to overwrite the
+other's mutation (a lost update). Never replace this pattern with a single-field patch
+call, because the Hub dataset repo API does not support atomic partial updates.
+
+The `_push_to_hub()` function must retry on HTTP 429 with exponential backoff and must
+NOT retry on any other HTTP error. A 404 means the repo does not exist (operator
+configuration error — raise immediately). A 403 means the token lacks write permission
+(operator configuration error — raise immediately). A 500 means the Hub had an internal
+error — raise immediately with a clear message so the job is marked failed and the
+user is notified. Only 429 is a retryable condition.
+
+The `force_download=True` parameter in `_pull_from_hub()` is mandatory. Without it,
+the HF Hub client may serve a locally cached copy of the jobs JSON that does not
+reflect mutations made by other processes. On a free-tier Space there is only one
+process, but the parameter must still be set as a defensive measure against future
+multi-worker deployments.
+
+---
+
+## cache.py — Specific Implementation Rules
+
+The cache must be seeded from `job_store.load_all_jobs()` at startup before any
+Gradio request can be processed. In `app.py`, this must happen at module import time,
+not inside the first request handler. If the seed fails (Hub unreachable at startup),
+the cache starts empty and logs a warning — it does NOT raise and does NOT prevent
+the app from starting.
+
+The `put()` function must be called after every successful `job_store.*` write call.
+The pattern in `app.py` is: call `job_store.update_job_chunk()` → immediately call
+`cache.put(job_id, record)` with the returned record. If you add a new `job_store`
+function, you must add the corresponding `cache.put()` call at every call site.
+
+The `get_system_status()` function must not count completed or failed jobs in the
+active or queued tallies. Only "processing" jobs count as active; only "queued" jobs
+count as queued. A job in "complete" or "failed" status is finished and must not
+contribute to load level calculations.
+
+---
+
+## Test Requirements for This Package
+
+All Hub API calls in `job_store.py` tests must be mocked using `unittest.mock.patch`.
+Tests must never make real network calls. The mocked `_pull_from_hub` must return a
+dict whose structure matches the canonical job record schema. The mocked `_push_to_hub`
+must be a no-op that records whether it was called and with what arguments.
+
+Write a dedicated test for the 429 retry behaviour: mock `_push_to_hub` to raise a
+`Exception("429")` on the first two calls and succeed on the third. Assert that the
+function retried exactly twice before succeeding and that the final record is correct.
+
+Write a dedicated test for the startup recovery path: call `load_all_jobs()` with a
+mocked Hub that returns two records (one "processing", one "queued") and assert that
+both are present in the returned dict.
+
+---
+
+## Running Tests for This Package Only
+
+```bash
+pytest tests/test_job_store.py -v
+```
+
+Expected: all pass, no network calls, no HF_TOKEN required. Set `HF_TOKEN` to any
+non-empty string in the test environment if the import-time Hub client initialization
+requires it, but the tests themselves must not make real API calls.
