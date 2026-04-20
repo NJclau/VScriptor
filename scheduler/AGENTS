@@ -1,0 +1,83 @@
+# scheduler/AGENTS.md
+# Codex: this overrides root guidance for work inside the scheduler/ package.
+# Read the root AGENTS.md first. Then apply the additional rules below.
+
+---
+
+## Package Responsibility
+
+This package owns one concern: deciding whether a job is allowed to enter the
+processing pipeline, and which slot it occupies when it does. It has no knowledge of
+inference, no knowledge of Hub state, and no knowledge of the Gradio UI. It only
+answers the question: "Is there capacity right now for a job of this duration?"
+
+---
+
+## The Semaphore Contract
+
+`AdmissionController` uses two `asyncio.Semaphore` instances. These are not
+`threading.Semaphore` — they are async-aware and must be used with `await`. The
+`acquire()` method is a coroutine and must be called with `await`. The `release()`
+method is synchronous and must be called in a `finally` block at every call site.
+
+There is no built-in timeout on `acquire()`. A job that arrives when all slots are
+occupied will await indefinitely. In `app.py`, if you want to reject a request after
+a waiting period rather than queue it, wrap the `acquire()` call in
+`asyncio.wait_for(admission.acquire(...), timeout=QUEUE_WAIT_TIMEOUT_SECS)` and
+catch `asyncio.TimeoutError` to return the "at capacity" message. The timeout value
+must be defined in `config.py`.
+
+---
+
+## Slot Classification Logic
+
+The routing decision is binary and based solely on the `duration_secs` argument.
+Jobs at or below `SHORT_JOB_THRESHOLD_SECS` go to the short-job semaphore. Jobs above
+that threshold go to the primary semaphore. There is no third category. If you find
+yourself writing an `elif` or a third slot type, reconsider whether you are solving
+a real scheduling problem or creating unnecessary complexity.
+
+The `MAX_AUDIO_DURATION_SECS` check must happen before any semaphore acquisition.
+A job that exceeds the cap must be rejected immediately with a `ValueError` containing
+the measured duration and the cap value. This gives the user the specific information
+they need to trim their file. Do not return a generic "too long" message.
+
+---
+
+## Why These Slot Numbers
+
+The primary slot count of 2 is set by `MAX_PRIMARY_SLOTS` in `config.py`. It was
+chosen because a 3-minute audio file processed at 45 seconds per minute of audio takes
+roughly 135 seconds of CPU time. Two such jobs running concurrently require ~4.5 CPU-
+minutes within a 3-minute wall clock window, which fits within the 2-vCPU free tier
+allocation without thrashing. A third concurrent long job would push the system into
+memory pressure and cause latency to become unpredictable.
+
+If the team upgrades to a paid tier with more CPU, increase `MAX_PRIMARY_SLOTS` in
+`config.py` only — never in this file. This is why constants live in config.
+
+---
+
+## Test Requirements for This Package
+
+The admission controller tests must cover four scenarios. First, a short-duration job
+must acquire the short-job slot, not the primary slot. Second, a long-duration job
+must acquire a primary slot. Third, a job exceeding `MAX_AUDIO_DURATION_SECS` must
+raise `ValueError` before any semaphore is touched. Fourth, when both primary slots
+are held, a third long job must wait (or timeout if you implement `asyncio.wait_for`)
+— it must not acquire a slot until one is released.
+
+All admission controller tests must run without any mocking because the semaphore is
+pure in-memory logic with no external dependencies. Use `pytest-asyncio` for async
+test functions. Mark async tests with `@pytest.mark.asyncio`.
+
+---
+
+## Running Tests for This Package Only
+
+```bash
+pytest tests/test_admission.py -v
+```
+
+Expected: all pass, no network calls, no GPU, no HF_TOKEN. These tests must complete
+in under 2 seconds total because they exercise only in-memory semaphore logic.
