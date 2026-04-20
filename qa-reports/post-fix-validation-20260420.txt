@@ -1,0 +1,22 @@
+============================= test session starts ==============================
+platform linux -- Python 3.10.19, pytest-9.0.2, pluggy-1.6.0 -- /root/.pyenv/versions/3.10.19/bin/python
+cachedir: .pytest_cache
+rootdir: /workspace/VScriptor
+configfile: pytest.ini
+plugins: anyio-4.13.0
+collecting ... collected 12 items
+
+tests/test_job_store.py::test_load_all_jobs_returns_records_from_hub_payload PASSED [  8%]
+tests/test_job_store.py::test_create_job_persists_record_with_push PASSED [ 16%]
+tests/test_job_store.py::test_push_to_hub_retries_on_429_before_success PASSED [ 25%]
+tests/test_job_store.py::test_update_job_chunk_transitions_job_to_processing PASSED [ 33%]
+tests/test_stress_simulation.py::test_concurrent_job_lifecycle_stress_audit_reports_low_risk_completion PASSED [ 41%]
+tests/test_push_failure_resilience.py::test_push_failure_on_create_reports_exception_and_no_durable_write PASSED [ 50%]
+tests/test_push_failure_resilience.py::test_push_failure_mid_chunk_update_leaves_last_durable_checkpoint PASSED [ 58%]
+tests/test_push_failure_resilience.py::test_push_failure_on_complete_preserves_running_state_and_signals_error PASSED [ 66%]
+tests/test_push_failure_resilience.py::test_source_inspection_reports_retry_backoff_presence_in_job_store PASSED [ 75%]
+tests/test_write_queue.py::test_queue_import_and_instantiation PASSED    [ 83%]
+tests/test_write_queue.py::test_queue_enqueue_and_drain_behavior PASSED  [ 91%]
+tests/test_write_queue.py::test_queue_processing_order_is_sequential_fifo PASSED [100%]
+
+============================== 12 passed in 6.48s ==============================

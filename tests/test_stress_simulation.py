@@ -12,7 +12,7 @@ from unittest.mock import patch
 from state import job_store
 
 
-def test_concurrent_job_lifecycle_stress_audit_reports_critical_incomplete_jobs() -> None:
+def test_concurrent_job_lifecycle_stress_audit_reports_low_risk_completion() -> None:
     """Launch 10 concurrent jobs and audit final durable state completeness."""
     job_count = 10
     chunks_per_job = 3
@@ -118,8 +118,8 @@ def test_concurrent_job_lifecycle_stress_audit_reports_critical_incomplete_jobs(
     else:
         print("incomplete/missing jobs table: none")
 
-    risk_classification = "CRITICAL" if incomplete_or_missing else "LOW"
+    risk_classification = "LOW" if not incomplete_or_missing else "HIGH"
     print(f"risk classification: {risk_classification}")
 
-    assert risk_classification == "CRITICAL"
-    assert completed_jobs_count < job_count
+    assert completed_jobs_count == job_count
+    assert risk_classification == "LOW"
