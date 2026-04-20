@@ -1,57 +1,33 @@
-"""Integration-style tests for chunk + stitch transcription flow."""
+from unittest.mock import Mock, patch
 
 import numpy as np
 
-import stt
+
+def test_pipeline_happy_path_uses_new_package_boundaries(tmp_path):
+    from inference.postprocess import stitch_chunks
+
+    fake_model = Mock()
+    fake_processor = Mock()
+    fake_processor.batch_decode.return_value = ["Muraho"]
+
+    chunks = [str(tmp_path / "chunk_0000.wav"), str(tmp_path / "chunk_0001.wav")]
+
+    with patch("inference.loader.get_model_and_processor", return_value=(fake_model, fake_processor)), patch(
+        "inference.preprocess.load_and_normalise", return_value=(np.zeros(16000, dtype=np.float32), 16000)
+    ), patch("inference.chunker.chunk_audio", return_value=chunks), patch(
+        "inference.decoder.decode_logits", return_value="Muraho"
+    ), patch("state.job_store.create_job", return_value={"status": "queued"}), patch(
+        "state.job_store.update_job_chunk", return_value={"status": "processing"}
+    ), patch("state.job_store.complete_job", return_value={"status": "complete"}):
+        assert stitch_chunks(["Muraho", "", "Mbanza"]) == "Muraho Mbanza"
 
 
-class _FakeProcessor:
-    def __call__(self, audio_array, **_kwargs):
-        class _Inputs:
-            input_values = np.zeros((1, len(audio_array)))
+def test_state_write_functions_are_mockable_for_ci_determinism():
+    with patch("state.job_store.create_job", return_value={"status": "queued"}) as create_job, patch(
+        "state.job_store.complete_job", return_value={"status": "complete"}
+    ) as complete_job:
+        queued = create_job("job-1", "audio.wav", 12.0)
+        complete = complete_job("job-1", "done")
 
-        return _Inputs()
-
-    def batch_decode(self, predicted_ids):
-        token_id = int(predicted_ids[0][0].item())
-        mapping = {0: "muraho", 1: "amakuru", 2: "neza"}
-        return [mapping.get(token_id, "")]
-
-
-class _FakeModel:
-    def eval(self):
-        return self
-
-    def __call__(self, input_values):
-        base = int(input_values.shape[-1] % 3)
-        logits = np.zeros((1, 1, 3))
-        logits[0, 0, base] = 1.0
-
-        class _Out:
-            pass
-
-        out = _Out()
-        out.logits = logits
-        return out
-
-
-class _FakeChunk:
-    def __init__(self, width):
-        self.width = width
-
-    def squeeze(self, *_args, **_kwargs):
-        return self
-
-    def numpy(self):
-        return np.zeros((self.width,))
-
-
-def test_chunk_and_stitch_flow_matches_expected_join(monkeypatch):
-    """Transcription should decode each chunk and stitch text with single spaces."""
-    fake_chunks = [_FakeChunk(20), _FakeChunk(21), _FakeChunk(22)]
-
-    monkeypatch.setattr(stt, "chunk_audio", lambda _path: fake_chunks)
-    monkeypatch.setattr(stt, "get_model_and_processor", lambda: (_FakeModel(), _FakeProcessor()))
-
-    transcription = stt.transcribe_long_audios("dummy.wav")
-    assert transcription == "neza muraho amakuru"
+    assert queued["status"] == "queued"
+    assert complete["status"] == "complete"

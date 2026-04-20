@@ -1,14 +1,25 @@
-"""Logits decoding utilities."""
+"""Streaming decoder for long audio files."""
+
+from nemo.collections.asr.parts.utils.streaming_utils import FrameBatchASR
 
 
-def decode_logits_ctc_greedy(logits, processor) -> str:
-    """Decode model logits using CTC greedy decoding and return text."""
-    if hasattr(logits, "argmax"):
-        try:
-            predicted_ids = logits.argmax(dim=-1)
-        except TypeError:
-            predicted_ids = logits.argmax(axis=-1)
-    else:
-        raise ValueError("Unsupported logits type for greedy CTC decoding.")
-    transcript = processor.batch_decode(predicted_ids)[0]
-    return transcript.strip()
+def decode_long_audio(filename: str, asr_model, stream_config: dict) -> str:
+    """Run frame-batch streaming decode for a long audio file."""
+    asr_model.eval()
+    asr_model = asr_model.to(asr_model.device)
+
+    frame_asr = FrameBatchASR(
+        asr_model=asr_model,
+        frame_len=stream_config["chunk_len_secs"],
+        total_buffer=stream_config["total_buffer_secs"],
+        batch_size=stream_config["batch_size"],
+    )
+    frame_asr.read_audio_file(
+        filename,
+        stream_config["mid_delay"],
+        stream_config["model_stride_secs"],
+    )
+    return frame_asr.transcribe(
+        stream_config["tokens_per_chunk"],
+        stream_config["mid_delay"],
+    )
