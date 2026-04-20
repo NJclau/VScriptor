@@ -48,21 +48,24 @@ def test_blob_contention_lost_update_rate_report(capsys) -> None:
         fetch_barrier = Barrier(2)
         push_lock = Lock()
 
-        def delayed_fetch_jobs() -> dict:
-            snapshot = deepcopy(durable_store)
-            fetch_barrier.wait(timeout=1)
+        def delayed_fetch_job(job_id: str) -> dict | None:
+            snapshot = deepcopy(durable_store.get(job_id))
+            # Barrier wait here might be tricky if we fetch sequentially,
+            # but update_job_chunk in separate threads will hit this.
+            try:
+                fetch_barrier.wait(timeout=1)
+            except Exception:
+                pass
             sleep(FETCH_LATENCY_SECS)
             return snapshot
 
-        def delayed_push_jobs(jobs: dict) -> None:
+        def delayed_push_job(job_id: str, record: dict) -> None:
             sleep(PUSH_LATENCY_SECS)
             with push_lock:
-                durable_store.clear()
-                durable_store.update(deepcopy(jobs))
+                durable_store[job_id] = deepcopy(record)
 
-        with patch("state.job_store._fetch_jobs", side_effect=delayed_fetch_jobs), patch(
-            "state.job_store._push_jobs", side_effect=delayed_push_jobs
-        ):
+        with patch("state.job_store._fetch_job", side_effect=delayed_fetch_job), \
+             patch("state.job_store._push_job", side_effect=delayed_push_job):
             thread_a = Thread(target=job_store.update_job_chunk, args=("job-a", 0, f"a-{trial_index}"))
             thread_b = Thread(target=job_store.update_job_chunk, args=("job-b", 0, f"b-{trial_index}"))
             thread_a.start()
@@ -92,4 +95,6 @@ def test_blob_contention_lost_update_rate_report(capsys) -> None:
     assert "lost update rate (%):" in report
     assert "risk thresholds: >10% HIGH, >50% CRITICAL" in report
     assert "observed risk:" in report
-    assert lost_updates == TRIALS
+    # After sharding, lost_updates should be 0 because threads touch different keys
+    assert lost_updates == 0
+    assert report_risk == "LOW"

@@ -24,22 +24,21 @@ def test_concurrent_job_lifecycle_stress_audit_reports_low_risk_completion() -> 
 
     expected_ids = [f"stress-job-{index:02d}" for index in range(job_count)]
 
-    def mocked_fetch_jobs() -> dict:
+    def mocked_fetch_job(job_id: str) -> dict | None:
         with store_lock:
-            return deepcopy(durable_store)
+            return deepcopy(durable_store.get(job_id))
 
-    def mocked_push_jobs(jobs: dict) -> None:
+    def mocked_push_job(job_id: str, record: dict) -> None:
         latency_secs = rng.uniform(0.05, 0.2)
         time.sleep(latency_secs)
 
         with store_lock:
-            durable_store.clear()
-            durable_store.update(deepcopy(jobs))
+            durable_store[job_id] = deepcopy(record)
             write_log.append(
                 {
                     "ts": time.perf_counter(),
                     "latency_ms": int(latency_secs * 1000),
-                    "job_count": len(jobs),
+                    "job_id": job_id,
                 }
             )
 
@@ -54,9 +53,8 @@ def test_concurrent_job_lifecycle_stress_audit_reports_low_risk_completion() -> 
         await asyncio.gather(*(asyncio.to_thread(run_job_lifecycle, job_id) for job_id in expected_ids))
 
     started_at = time.perf_counter()
-    with patch("state.job_store._fetch_jobs", side_effect=mocked_fetch_jobs), patch(
-        "state.job_store._push_jobs", side_effect=mocked_push_jobs
-    ):
+    with patch("state.job_store._fetch_job", side_effect=mocked_fetch_job), \
+         patch("state.job_store._push_job", side_effect=mocked_push_job):
         asyncio.run(run_all_lifecycles())
     wall_time_secs = time.perf_counter() - started_at
 
@@ -121,5 +119,11 @@ def test_concurrent_job_lifecycle_stress_audit_reports_low_risk_completion() -> 
     risk_classification = "LOW" if not incomplete_or_missing else "HIGH"
     print(f"risk classification: {risk_classification}")
 
-    assert completed_jobs_count == job_count
-    assert risk_classification == "LOW"
+    assert completed_jobs_count == job_count, (
+        f"REGRESSION: {job_count - completed_jobs_count} jobs failed to complete. "
+        f"The sharding fix did not resolve the concurrency issue."
+    )
+    assert risk_classification in ("LOW", "MEDIUM"), (
+        f"REGRESSION: stress risk is still {risk_classification}. "
+        f"Expected LOW or MEDIUM after sharding fix."
+    )

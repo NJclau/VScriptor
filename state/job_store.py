@@ -1,130 +1,166 @@
 """
-Single source of durable job state.
-
-All reads and writes go to the HF Dataset repo defined in config.
-
-This module is the ONLY writer. cache.py is the only reader for the UI.
+Sharded durable job store backed by HF Dataset repo.
+Each job is isolated in jobs/{job_id}.json — concurrent jobs never share a file.
+All Hub I/O retries on 429 / 5xx with exponential backoff via tenacity.
+Public API is unchanged from the previous monolithic implementation.
 """
-
-from __future__ import annotations
 
 import json
 import os
 import tempfile
-import threading
 import time
 
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi
 from huggingface_hub.utils import EntryNotFoundError
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
 
-from config import BACKOFF_BASE_SECS, BACKOFF_MAX_SECS, BACKOFF_MULTIPLIER, HF_DATASET_REPO, JOB_STATE_FILE
+from config import HF_DATASET_REPO, JOB_STATE_DIR
 
 _api = HfApi()
-_write_lock = threading.Lock()
+
+# ---------------------------------------------------------------------------
+# Retry policy — wraps every Hub call
+# Retries on network errors and HF rate limits (429).
+# Gives up after 5 attempts (~2 min total with backoff).
+# ---------------------------------------------------------------------------
+_hub_retry = retry(
+    retry=retry_if_exception_type((Exception,)),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=10, min=10, max=120),
+    reraise=True,
+)
 
 
-def _fetch_jobs() -> dict:
-    """Pull the current jobs.json from the Hub. Returns empty dict if not found."""
+def _job_path(job_id: str) -> str:
+    """Hub path for this job's isolated state file."""
+    return f"{JOB_STATE_DIR}/{job_id}.json"
+
+
+@_hub_retry
+def _fetch_job(job_id: str) -> dict | None:
+    """Pull a single job record from Hub. Returns None if not yet created."""
     try:
-        path = hf_hub_download(
+        path = _api.hf_hub_download(
             repo_id=HF_DATASET_REPO,
-            filename=JOB_STATE_FILE,
+            filename=_job_path(job_id),
             repo_type="dataset",
-            force_download=True,
         )
-        with open(path, encoding="utf-8") as file_handle:
-            return json.load(file_handle)
+        with open(path) as f:
+            return json.load(f)
     except EntryNotFoundError:
-        return {}
-    except Exception as exc:
-        raise RuntimeError(f"job_store: failed to fetch state from Hub: {exc}") from exc
+        return None
+    except Exception as e:
+        raise RuntimeError(
+            f"job_store: failed to fetch {job_id} from Hub: {e}"
+        ) from e
 
 
-def _push_jobs(jobs: dict) -> None:
-    """Write jobs dict back to Hub as jobs.json, retrying only HTTP 429 with backoff."""
-    delay_secs = BACKOFF_BASE_SECS
-
-    while True:
-        tmp_path = ""
-        try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False, encoding="utf-8") as tmp:
-                json.dump(jobs, tmp, indent=2)
-                tmp_path = tmp.name
-            _api.upload_file(
-                path_or_fileobj=tmp_path,
-                path_in_repo=JOB_STATE_FILE,
-                repo_id=HF_DATASET_REPO,
-                repo_type="dataset",
-                commit_message=f"state: job update at {int(time.time())}",
-            )
-            return
-        except Exception as exc:
-            if "429" in str(exc) and delay_secs <= BACKOFF_MAX_SECS:
-                time.sleep(delay_secs)
-                delay_secs *= BACKOFF_MULTIPLIER
-                continue
-            raise RuntimeError(f"job_store: failed to push state to Hub: {exc}") from exc
-        finally:
-            if tmp_path and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+@_hub_retry
+def _push_job(job_id: str, record: dict) -> None:
+    """Write a single job record to Hub as jobs/{job_id}.json."""
+    tmp_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False
+        ) as tmp:
+            json.dump(record, tmp, indent=2)
+            tmp_path = tmp.name
+        _api.upload_file(
+            path_or_fileobj=tmp_path,
+            path_in_repo=_job_path(job_id),
+            repo_id=HF_DATASET_REPO,
+            repo_type="dataset",
+            commit_message=f"state: {job_id} @ {int(time.time())}",
+        )
+    except Exception as e:
+        raise RuntimeError(
+            f"job_store: failed to push {job_id} to Hub: {e}"
+        ) from e
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
-def create_job(job_id: str, audio_path: str, duration_secs: float, total_chunks: int) -> dict:
-    with _write_lock:
-        jobs = _fetch_jobs()
-        record = {
-            "job_id": job_id,
-            "audio_path": audio_path,
-            "duration_secs": duration_secs,
-            "total_chunks": total_chunks,
-            "completed_chunks": 0,
-            "chunk_transcripts": [],
-            "status": "running",
-            "created_at": int(time.time()),
-            "final_transcript": None,
-            "error": None,
-        }
-        jobs[job_id] = record
-        _push_jobs(jobs)
-        return record
+# ---------------------------------------------------------------------------
+# Public API — signatures unchanged from monolithic implementation
+# ---------------------------------------------------------------------------
+
+def create_job(
+    job_id: str,
+    audio_path: str,
+    duration_secs: float,
+    total_chunks: int,
+) -> dict:
+    record = {
+        "job_id": job_id,
+        "audio_path": audio_path,
+        "duration_secs": duration_secs,
+        "total_chunks": total_chunks,
+        "completed_chunks": 0,
+        "chunk_transcripts": [],
+        "status": "running",
+        "created_at": int(time.time()),
+        "final_transcript": None,
+        "error": None,
+    }
+    _push_job(job_id, record)
+    return record
 
 
 def update_job_chunk(job_id: str, chunk_index: int, transcript_text: str) -> dict:
-    with _write_lock:
-        jobs = _fetch_jobs()
-        if job_id not in jobs:
-            raise KeyError(f"job_store: job {job_id} not found")
-        jobs[job_id]["chunk_transcripts"].append(transcript_text)
-        jobs[job_id]["completed_chunks"] = chunk_index + 1
-        _push_jobs(jobs)
-        return jobs[job_id]
+    record = _fetch_job(job_id)
+    if record is None:
+        raise KeyError(f"job_store: job {job_id} not found")
+    record["chunk_transcripts"].append(transcript_text)
+    record["completed_chunks"] = chunk_index + 1
+    _push_job(job_id, record)
+    return record
 
 
 def complete_job(job_id: str, final_transcript: str) -> dict:
-    with _write_lock:
-        jobs = _fetch_jobs()
-        if job_id not in jobs:
-            raise KeyError(f"job_store: job {job_id} not found")
-        jobs[job_id]["status"] = "complete"
-        jobs[job_id]["final_transcript"] = final_transcript
-        jobs[job_id]["completed_at"] = int(time.time())
-        _push_jobs(jobs)
-        return jobs[job_id]
+    record = _fetch_job(job_id)
+    if record is None:
+        raise KeyError(f"job_store: job {job_id} not found")
+    record["status"] = "complete"
+    record["final_transcript"] = final_transcript
+    record["completed_at"] = int(time.time())
+    _push_job(job_id, record)
+    return record
 
 
 def fail_job(job_id: str, reason: str) -> dict:
-    with _write_lock:
-        jobs = _fetch_jobs()
-        if job_id not in jobs:
-            raise KeyError(f"job_store: job {job_id} not found")
-        jobs[job_id]["status"] = "failed"
-        jobs[job_id]["error"] = reason
-        jobs[job_id]["failed_at"] = int(time.time())
-        _push_jobs(jobs)
-        return jobs[job_id]
+    record = _fetch_job(job_id)
+    if record is None:
+        raise KeyError(f"job_store: job {job_id} not found")
+    record["status"] = "failed"
+    record["error"] = reason
+    record["failed_at"] = int(time.time())
+    _push_job(job_id, record)
+    return record
 
 
+@_hub_retry
 def load_all_jobs() -> list[dict]:
-    """Called on Space startup to seed the volatile cache."""
-    jobs = _fetch_jobs()
-    return list(jobs.values())
+    """Called on Space startup to seed the volatile cache from Hub."""
+    try:
+        files = _api.list_repo_tree(
+            repo_id=HF_DATASET_REPO,
+            repo_type="dataset",
+            path_in_repo=JOB_STATE_DIR,
+        )
+        jobs = []
+        for f in files:
+            job_id = f.rfilename.replace(f"{JOB_STATE_DIR}/", "").replace(".json", "")
+            record = _fetch_job(job_id)
+            if record:
+                jobs.append(record)
+        return jobs
+    except EntryNotFoundError:
+        return []
+    except Exception as e:
+        raise RuntimeError(f"job_store: failed to load all jobs from Hub: {e}") from e
