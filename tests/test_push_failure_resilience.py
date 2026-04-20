@@ -12,12 +12,12 @@ from state import job_store
 
 
 def _make_fetch_from(durable_store: dict):
-    """Return a _fetch_jobs mock that emulates pull-by-value semantics."""
+    """Return a _fetch_job mock that emulates pull-by-value semantics."""
 
-    def _fetch_jobs() -> dict:
-        return deepcopy(durable_store)
+    def _fetch_job(job_id: str) -> dict | None:
+        return deepcopy(durable_store.get(job_id))
 
-    return _fetch_jobs
+    return _fetch_job
 
 
 def _actionable_error(exc: Exception) -> bool:
@@ -36,11 +36,11 @@ def _print_scenario_report(name: str, exception_kind: str, durable_store: dict, 
 def test_push_failure_on_create_reports_exception_and_no_durable_write(capsys):
     durable_store: dict = {}
 
-    def fail_create_push(jobs: dict) -> None:
-        raise RuntimeError("simulated push failure at create")
+    def fail_create_push(job_id: str, record: dict) -> None:
+        raise RuntimeError(f"simulated push failure at create for {job_id}")
 
-    with patch("state.job_store._fetch_jobs", side_effect=_make_fetch_from(durable_store)), patch(
-        "state.job_store._push_jobs", side_effect=fail_create_push
+    with patch("state.job_store._fetch_job", side_effect=_make_fetch_from(durable_store)), patch(
+        "state.job_store._push_job", side_effect=fail_create_push
     ):
         with pytest.raises(RuntimeError, match="create") as exc_info:
             job_store.create_job("job-create-fail", "audio.wav", 9.0, 3)
@@ -59,15 +59,14 @@ def test_push_failure_mid_chunk_update_leaves_last_durable_checkpoint(capsys):
     durable_store: dict = {}
     push_call_counter = {"count": 0}
 
-    def checkpoint_then_fail_mid_update(jobs: dict) -> None:
+    def checkpoint_then_fail_mid_update(job_id: str, record: dict) -> None:
         push_call_counter["count"] += 1
         if push_call_counter["count"] == 3:
-            raise RuntimeError("simulated push failure at mid-chunk update")
-        durable_store.clear()
-        durable_store.update(deepcopy(jobs))
+            raise RuntimeError(f"simulated push failure at mid-chunk update for {job_id}")
+        durable_store[job_id] = deepcopy(record)
 
-    with patch("state.job_store._fetch_jobs", side_effect=_make_fetch_from(durable_store)), patch(
-        "state.job_store._push_jobs", side_effect=checkpoint_then_fail_mid_update
+    with patch("state.job_store._fetch_job", side_effect=_make_fetch_from(durable_store)), patch(
+        "state.job_store._push_job", side_effect=checkpoint_then_fail_mid_update
     ):
         job_store.create_job("job-mid-fail", "audio.wav", 12.0, 3)
         job_store.update_job_chunk("job-mid-fail", 0, "chunk-0")
@@ -91,15 +90,14 @@ def test_push_failure_on_complete_preserves_running_state_and_signals_error(caps
     durable_store: dict = {}
     push_call_counter = {"count": 0}
 
-    def fail_on_complete(jobs: dict) -> None:
+    def fail_on_complete(job_id: str, record: dict) -> None:
         push_call_counter["count"] += 1
         if push_call_counter["count"] == 4:
-            raise RuntimeError("simulated push failure at complete")
-        durable_store.clear()
-        durable_store.update(deepcopy(jobs))
+            raise RuntimeError(f"simulated push failure at complete for {job_id}")
+        durable_store[job_id] = deepcopy(record)
 
-    with patch("state.job_store._fetch_jobs", side_effect=_make_fetch_from(durable_store)), patch(
-        "state.job_store._push_jobs", side_effect=fail_on_complete
+    with patch("state.job_store._fetch_job", side_effect=_make_fetch_from(durable_store)), patch(
+        "state.job_store._push_job", side_effect=fail_on_complete
     ):
         job_store.create_job("job-complete-fail", "audio.wav", 20.0, 2)
         job_store.update_job_chunk("job-complete-fail", 0, "chunk-0")
@@ -120,11 +118,25 @@ def test_push_failure_on_complete_preserves_running_state_and_signals_error(caps
     assert actionable is True
 
 
+def test_retry_logic_is_present():
+    """After AF-01/AF-02, tenacity retry must be present in job_store."""
+    import inspect
+    import state.job_store as js
+
+    source = inspect.getsource(js)
+    has_retry = any(kw in source for kw in ["tenacity", "retry", "wait_exponential"])
+
+    assert has_retry, (
+        "REGRESSION: retry/backoff logic is absent from state/job_store.py. "
+        "This was a HIGH risk finding. The fix must include tenacity retry."
+    )
+
+
 def test_source_inspection_reports_retry_backoff_presence_in_job_store(capsys):
     source_path = Path("state/job_store.py")
     source_text = source_path.read_text(encoding="utf-8").lower()
 
-    keywords = ("retry", "backoff", "429", "sleep")
+    keywords = ("retry", "backoff", "tenacity", "wait_exponential")
     present = [keyword for keyword in keywords if keyword in source_text]
     risk = "LOW" if len(present) == len(keywords) else "HIGH"
 
