@@ -1,47 +1,38 @@
-"""Volatile in-memory cache for UI read operations."""
+"""Volatile in-memory cache for UI reads."""
 
 from __future__ import annotations
 
-from threading import Lock
-from typing import Any
+from copy import deepcopy
 
-_cache: dict[str, dict[str, Any]] = {}
-_cache_lock = Lock()
+_CACHE: dict[str, dict] = {}
 
 
-def seed_from_store(jobs: dict[str, dict[str, Any]]) -> None:
-    """Replace cache contents with records loaded from durable storage."""
-    with _cache_lock:
-        _cache.clear()
-        _cache.update(jobs)
+def seed_from_store(records: dict[str, dict]) -> None:
+    """Seed cache from durable store records."""
+    _CACHE.clear()
+    for job_id, record in records.items():
+        _CACHE[job_id] = deepcopy(record)
 
 
-def put(job_id: str, record: dict[str, Any]) -> None:
-    """Store or update a single job record in cache."""
-    with _cache_lock:
-        _cache[job_id] = record
+def put(job_id: str, record: dict) -> None:
+    """Write a record snapshot into cache."""
+    _CACHE[job_id] = deepcopy(record)
 
 
-def get(job_id: str) -> dict[str, Any] | None:
-    """Fetch a single job record from cache."""
-    with _cache_lock:
-        return _cache.get(job_id)
+def get(job_id: str) -> dict | None:
+    """Get one job from cache."""
+    record = _CACHE.get(job_id)
+    return deepcopy(record) if record else None
 
 
-def get_system_status() -> dict[str, Any]:
-    """Return lightweight status info for the UI status widget."""
-    with _cache_lock:
-        active_jobs = sum(1 for record in _cache.values() if record.get("status") == "processing")
-        queued_jobs = sum(1 for record in _cache.values() if record.get("status") == "queued")
-
-    load_level = "idle"
-    if active_jobs > 0:
-        load_level = "busy"
-    if queued_jobs > 0:
-        load_level = "queued"
-
+def get_system_status() -> dict:
+    """Return UI status payload from cache only."""
+    jobs = [deepcopy(item) for item in _CACHE.values()]
+    active_jobs = sum(1 for item in jobs if item.get("status") == "processing")
+    queued_jobs = sum(1 for item in jobs if item.get("status") == "queued")
     return {
         "active_jobs": active_jobs,
         "queued_jobs": queued_jobs,
-        "load_level": load_level,
+        "total_jobs": len(jobs),
+        "jobs": jobs,
     }
